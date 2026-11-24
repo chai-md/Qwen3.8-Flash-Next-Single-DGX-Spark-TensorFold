@@ -150,3 +150,36 @@ coordinator は全ワーカーを統括し、未検証コードやレシート�
 - [ ] `python3 tools/receipt.py verify --staged` が PASS（`patches/*.patch` または `scripts/config.sh` 変更時）
 - [ ] `python3 tools/gpu_lock.py status` で `locked: false` を確認、`docker ps` に残留検証コンテナがないことを確認
 - [ ] `git commit`（Stage-1 / Stage-2 フック自動通過）および必要に応じ `README.md` / `work/opt/PLAN.md` を更新
+
+---
+
+## 6. 選定済みミッション（Wave 5: レバー A — 8192 行 Prefill 最大カーネル最適化）
+
+2026-11-25 の `TF_FLASHNEXT_PROFILE=1` 実測により、`c1` / `c5` / 短文 TTFT（25 行 = 99 ms ≈ 512 expert 中 ~39% の union 読込下限）はいずれも GB10 実測帯域（225.2 GB/s）の 86–97% に張り付いている一方、**8192 行 Prefill パスは `2,867 ms / chunk`（実効 35.5 TFLOPS vs BF16 TC 97.5 TFLOPS / FP8・FP4 TC 160+ TFLOPS）** と最大の未開拓余地（+30〜70%）があることを確認済み。
+
+### そのまま貼れる `/swarm` 起動プロンプト（レバー A）
+
+```text
+/swarm
+スキル `.agents/skills/spark-kernel-swarm/SKILL.md` と `optimizer.md` に従って、Wave 5（レバー A: 8192 行 Prefill 内 `2,867 ms/chunk` の最大 CUDA カーネル最適化）のチームを立ち上げてください。
+
+- 最適化レバー: 8192 行 Prefill パス（2,867 ms/chunk, 実効 35.5 TFLOPS）の支配的 CUDA カーネル最適化
+- 事前プロファイル（必須の第 1 手）: `bench-verifier` が `tools/gpu_lock.py acquire --holder bench-verifier` を取得し、現行 `tensorfold-qwen38:v1.3.4-12ebd41` で単発の 8192 行コールド Prefill を `nsys profile`（または CUDA イベント集計）して **GPU 時間上位 10 カーネル（カーネル名・総 ms・構成比 %・呼び出し回数）** をボードに共有してから実装方針を確定する。
+- 想定主対象候補（nsys 上位に基づき 1 つに絞る）:
+  - NVFP4 MoE prompt experts（`nvfp4_experts.cu` / `cuda_moe.zig`）
+  - 36 層 GDN 線形アテンション prefill（`flashnext_gdn*.cu` / `cuda_gdn.zig`）
+  - MXFP8 prompt projections / BF16 readout（`qmmf.cu` / `patches/0003-prompt-mxfp8-tile.patch`）
+- 狙う指標と目標: 4K / 32K / 128K / 200K prefill +5〜15%（`c1` / `c5` / TTFT / 起動時間 / メモリ悪化なし）
+- 厳守する採用基準:
+  1. `python3 tools/check_invariants.py` 全 PASS（新規 `TF_FLASHNEXT_*` は `environment.zig` 登録必須、CUDA Graph 破壊・`printf`・`std.debug.print`・`TODO`/`HACK` 禁止）
+  2. `tools/exact.py` および `tools/exact.py --pad 3000` が serial / `draft:false` / concurrent ビット完全一致
+  3. 交互 A/B（`ctl-a / cand / ctl-b`, `HOST=127.0.0.1`）で両側の対照群を上回り、他指標に退行なし
+  4. ピーク統合メモリ <= 112.0 GiB、`tools/prompt_reuse.py 30000` >= 90%
+  5. `tools/receipt.py record` でフィンガープリント一致の GPU レシート発行後にのみマージ・コミット
+
+チーム構成:
+1. `bench-verifier` (`workspace: "inherit"`, 単一 GPU 専有): Phase 1 で `gpu_lock.py` を取得し 8192 行 prefill の `nsys` カーネル内訳を取得・解放。Phase 4 で `critic` LGTM 後のビルド・交互 A/B・`exact.py`・`prompt_reuse.py`・レシート発行を担当。
+2. `profiler` (`workspace: "inherit"`): `bench-verifier` の `nsys` 上位カーネル結果を受け取り、TensorFold v1.3.4 ソースと `nvcc --ptxas-options=-v`（レジスタ数・スピル・SM 12.1 占有率・SMEM 使用量）を解析して、`author-1` 向けの具体的なカーネル最適化仕様書を作成。
+3. `author-1` (`workspace: "share"`): 独立 worktree で `patches/0006-*.patch`（必要なら `scripts/config.sh`）を実装。GPU は起動せず `tools/check_invariants.py` と静的コンパイル／PTXAS 検証まで完了して `@critic` に提出。
+4. `critic` (`workspace: "inherit"`): 数値丸め境界（行独立性・`exact.py` 維持）、CUDA Graph 安全性、メモリ制約、`environment.zig` 登録を敵対的レビューし、LGTM 時のみ `@bench-verifier` へ引き渡す。
+```
