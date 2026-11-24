@@ -46,7 +46,7 @@ numbers = sorted(int(p.name[:4]) for p in (ROOT / "patches").glob("[0-9][0-9][0-
 check(
     "patches/ is one unbroken series that includes the video patch",
     ([] if numbers == list(range(1, len(numbers) + 1)) else [f"patch numbers are {numbers}, expected 1..{len(numbers)}"])
-    + ([] if list((ROOT / "patches").glob("0005-*video*.patch")) else ["no 0005 video patch in patches/"]),
+    + ([] if list((ROOT / "patches").glob("[0-9][0-9][0-9][0-9]-*video*.patch")) else ["no video patch in patches/"]),
 )
 
 # ---- the pin, and the fact that the image hash covers it -------------------------------------
