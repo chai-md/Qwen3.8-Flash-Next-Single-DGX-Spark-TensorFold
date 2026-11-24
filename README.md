@@ -39,26 +39,28 @@ is unchanged.
 ## Performance
 
 > **The sparkDash tables below are the v1.1.4 build's** (TensorFold v1.1.4 with its patches `0001` to `0017`, 2026-10-27). The recipe now builds
-> TensorFold **v1.3.4** (`12ebd414`) with patches `0001` to `0005` ([What the patches are](#what-the-patches-are)) and tuned defaults in `scripts/config.sh`; sparkDash has not been
-> re-run on it. What has been measured on the same DGX Spark (2026-11-24, defaults: 262,144-token window, 5 streams, fp8 KV, vision on, bit-identical greedy outputs across builds) is an apples-to-apples A/B against the previous `main` recipe (`v1.2.7-93a2e93` with `TF_FLASHNEXT_CHUNK=3072` and patch `0004`):
+> TensorFold **v1.3.4** (`12ebd414`) with patches `0001` to `0006` ([What the patches are](#what-the-patches-are)) and tuned defaults in `scripts/config.sh`; sparkDash has not been
+> re-run on it. What has been measured on the same DGX Spark (2026-11-24/25, defaults: 262,144-token window, 5 streams, fp8 KV, vision on, bit-identical greedy outputs across builds) is an apples-to-apples A/B against the previous `main` recipe (`v1.2.7-93a2e93` with `TF_FLASHNEXT_CHUNK=3072` and patch `0004`):
 >
 > **`tools/bench_streams.py`** (identical prompt per stream, thinking on, median of 3):
 >
-> | | `main` (v1.2.7) | **v1.3.4 optimized** | Change |
+> | | `main` (v1.2.7) | **v1.3.4 optimized (`0001..0006`)** | Change |
 > | --- | ---: | ---: | ---: |
-> | Decode prose, 1 / 3 / 5 streams (total tok/s) | 57.5 / 153.9 / 226.5 | **57.2 / 155.9 / 231.4** | −0.5% / +1.3% / **+2.2%** |
-> | Decode code, 1 / 3 / 5 streams (total tok/s) | 49.9 / 133.4 / 197.9 | **49.8 / 134.5 / 202.6** | −0.2% / +0.8% / **+2.4%** |
-> | Prefill 4k / 31.5k / 126k tokens (tok/s) | 2,368 / 2,429 / 2,294 | **2,518 / 2,682 / 2,485** | **+6.3% / +10.4% / +8.3%** |
-> | 199,730-token needle prefill (`tools/needle.py`) | 95.7 s (v1.2.7 README) | **84.87 s** (`found yes`) | **−11.3%** (−10.8 s) |
+> | Decode prose, 1 / 3 / 5 streams (total tok/s) | 57.5 / 153.9 / 226.5 | **57.3 / 155.7 / 232.0** | −0.3% / +1.2% / **+2.4%** |
+> | Decode code, 1 / 3 / 5 streams (total tok/s) | 49.9 / 133.4 / 197.9 | **50.0 / 134.9 / 202.5** | +0.2% / +1.1% / **+2.3%** |
+> | Prefill 4k / 31.5k / 126k tokens (tok/s) | 2,368 / 2,429 / 2,294 | **2,533 / 2,737 / 2,551** | **+7.0% / +12.7% / +11.2%** |
+> | 199,730-token needle prefill (`tools/needle.py`) | 95.7 s (v1.2.7 README) | **83.49 s** (`found yes`) | **−12.8%** (−12.2 s) |
 >
 > **Cold-prompt greedy panel** (`temperature=0`, thinking off, unique cold prompts, 5 distinct prompts for `c5`, identical SHA-256 outputs on all 6 prompts):
 >
-> | | `main` (v1.2.7) | Stock v1.3.4 | **v1.3.4 optimized** | vs `main` |
+> | | `main` (v1.2.7) | Stock v1.3.4 | v1.3.4 (`0001..0005`) | vs `main` |
 > | --- | ---: | ---: | ---: | ---: |
 > | Single-stream decode (`c1`, 6-prompt median; prose / code) | 50.83 (44.8 / 77.0) | 50.99 (44.7 / 77.1) | **55.36** (**49.0 / 81.8**) | **+8.9%** (+9.5% / +6.3%) |
 > | 5 distinct streams (`c5` wall-clock aggregate, tok/s) | 107.97 | 108.73 | **110.72** | **+2.5%** |
 > | Cold prefill 4k / 32k / 128k tokens (tok/s) | 2,309 / 2,455 / 2,358 | 2,311 / 2,447 / 2,349 | **2,677 / 2,666 / 2,532** | **+16.0% / +8.6% / +7.4%** |
 > | Steady-state short TTFT (ms) / cold startup (s) | 105.1 ms / 43.46 s | 97.1 ms\* / 42.6–44.1 s | **103.8 ms / 42.86 s** | −1.2% / −1.4% |
+>
+> *Wave 5C (`patches/0006-hcn-down-singlebuf-occ2.patch`) added on top of `0001..0005` in interleaved `ctl-a / cand / ctl-b` A/B (bit-exact SHAs): cold prefill **+2.46%** at 4k (`2,730.1`), **+2.75%** at 32k (`2,746.3`), **+2.55%** at 128k (`2,545.4`), `c1` **+5.27%** (`55.00 → 57.90`), `c5` **+0.92%**, and 200k needle prefill `84.87 s → 83.49 s` (**−1.63%**).*
 >
 > *\*Stock v1.3.4 short TTFT is the post-boot 3-run median; `main` and v1.3.4 optimized are the post-warm steady-state 5-run medians. Note that on `bench_streams.py`, the 1-stream prose/code rows ran immediately after the greedy panel when both builds already had those repeated prompt pages warm in the OS page cache; on cold prompts, `TF_FLASHNEXT_TABLE_WARM=1` yields +8.6–9.5% single-stream decode.*
 >
@@ -125,12 +127,12 @@ The Python numbers come from an earlier run with its own settings, so read these
 
 ### Checks
 
-On the clean **v1.3.4** build with patches `0001` to `0005` (2026-11-24, one Spark, the defaults: 5 requests, 262,144-token window, fp8 KV, vision on, `CHUNK_SOLO=8192`, `READOUT_FUSED=1`, `TABLE_WARM=1`, `ATTN_LANES=1`, `MTP_CACHE_ONLY=1`), all passing:
+On the clean **v1.3.4** build with patches `0001` to `0006` (2026-11-25, one Spark, the defaults: 5 requests, 262,144-token window, fp8 KV, vision on, `CHUNK_SOLO=8192`, `READOUT_FUSED=1`, `TABLE_WARM=1`, `ATTN_LANES=1`, `MTP_CACHE_ONLY=1`), all passing:
 `tools/exact.py` (six drafted greedy replies, 557 drafts accepted, equal `"draft": false`; six concurrent equal one-at-a-time),
 `tools/exact.py --pad 3000` (six drafted greedy replies, 551 drafts accepted, bit-exact across serial / `"draft": false` / concurrent),
-`tools/toolcheck.py` 3/3, `tools/visioncheck.py`, `tools/prompt_reuse.py 30000` (worst 99.3%, follow-up prefill 0.33 s vs 11.85 s cold),
-a 199,730-token needle found (`tools/needle.py 200000`, prefill **84.87 s**, answer `warm-library-4557`),
-`tools/context_boundary.py --context 262144` (16 checks), and all six offline unit tests (`tools/test_*.py`).
+`tools/toolcheck.py` 3/3, `tools/visioncheck.py`, `tools/prompt_reuse.py 30000` (worst 99.3%, follow-up prefill 0.33 s vs 11.67 s cold),
+a 199,730-token needle found (`tools/needle.py 200000`, prefill **83.49 s**, answer `warm-library-4557`),
+`tools/context_boundary.py --context 262144` (16 checks, on `0001..0005`), and all offline unit tests (`tools/test_*.py` + `tools/check_invariants.py`).
 Not re-run on v1.3.4: the sampled-exactness check, live `tool_choice: "required"` / `response_format` JSON schema requests, `PDF=1` live PDF rendering, and `scripts/harden.sh` execution.
 
 `0004` (video) has not been run on a Spark: it compiles (`zig build check-native-cuda-host`, zig 0.17.0) and its library builds (`zig build video`), but no
@@ -528,6 +530,7 @@ Drafted replies are still checked: a drafted reply matches `"draft": false`. (Th
 | `0003` | prompt passes run the MXFP8 projections 1,024 columns or wider on a 128 x 128 tile (64 x 64 for calls of 128 rows or fewer) that folds the block scales into the weights: one fp32 sum over K, 1.4–1.65x the exact kernels, prefill +7–9%. Prompt rows leave the exact kernels' bits (within their rounding bound; a row's bytes never depend on its chunk, so replies stay exact across drafting and batching); `TF_FLASHNEXT_PROMPT_MX128=0` turns it off (rebased onto v1.3.4) |
 | `0004` | video parts on the CUDA engine: Flash Next offers the template's `<\|video_pad\|>` groups to the server (the sampler and patchifier are TensorFold's `core/qwen_vl/video.zig`, the same the Triton host runs) and the shared media plan reads a group of video rows beside image rows. Nothing decodes a video until `VIDEO=1` puts `libtfvideo.so` on the loader's path (chai-md's [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), rebased onto v1.3.4) |
 | `0005` | DGX Spark / GB10 inference optimizations (bit-identical greedy outputs): (1) adds `fn_attn_prep_lanes_kv8` / `fn_attn_chunks_lanes_kv8` so `TF_FLASHNEXT_ATTN_LANES=1` collapses multi-stream shared-round attention into one launch under `--kv-cache fp8`; (2) `TF_FLASHNEXT_MTP_CACHE_ONLY=1` skips discarded attention/o_proj/writeback/MoE and one-shot `HeadKey` graph captures during MTP prompt absorption and raises absorption pieces to `min(1024, cap/8)`; (3) parallelizes startup CPU `affine4` draft-head quantization across up to 16 threads |
+| `0006` | `fn_hcn_down` single-buffered weight staging + `__launch_bounds__(224, 2)` on `fn_hcn_down2` (`flashnext_hcn.cuh` / `flashnext_hcn.cu`): drops SM 12.1 register usage from 152 → 110 regs (0 spills), doubling occupancy from 1 → 2 CTAs/SM (11 → 6 waves at 8,192 rows) with bit-identical FP32 math (+2.5–2.8% prefill, +5.3% cold `c1`, +0.9% `c5`, 200k needle 84.87 s → 83.49 s) |
 
 The v1.1.4 build carried seventeen patches. TensorFold v1.2.7–v1.3.4 absorbed most of them upstream (including the quantized NVIDIA FP4 vision tower and fused BF16 prompt read-out tiles via `TF_FLASHNEXT_READOUT_FUSED=1`), and the recipe enables their switches in `scripts/config.sh`.
 
@@ -585,8 +588,8 @@ covers this repository's scripts only.
   TensorFold's own Flash Next CUDA engine (code by Ash Hart and the TensorFold contributors, under TensorFold's licenses). The list, with where each
   idea comes from, is in [`CREDITS.md`](CREDITS.md): image token budget (`0001`), fp8 KV (`0002`; the format adapted from MiaAI-Lab's GLM recipe patch 0038)
   and the MXFP8 prompt tile (`0003`).
-- **Patch `0004` (video parts) and `0005` (DGX Spark optimizations):** `0004` by [chai-md](https://github.com/chai-md) in
-  [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), rebased onto TensorFold v1.3.4; `0005` adds fp8 KV lane-batched attention, cache-only MTP prompt absorption, and multi-threaded `affine4` draft-head quantization; MIT License like the rest of `patches/`.
+- **Patches `0004` to `0006` (video parts & DGX Spark optimizations):** `0004` by [chai-md](https://github.com/chai-md) in
+  [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), rebased onto TensorFold v1.3.4; `0005` adds fp8 KV lane-batched attention, cache-only MTP prompt absorption, and multi-threaded `affine4` draft-head quantization; `0006` doubles `fn_hcn_down2` SM 12.1 occupancy (1 → 2 CTAs/SM via single-buffered weight staging); MIT License like the rest of `patches/`.
   Several of the v1.1.4 build's patches (0004 to 0017) and the quantized FP4 vision tower patch are now part of TensorFold v1.3.4 in upstream's own form; upstream credits MiaAI-Lab for the K32
   expert staging it adapted from patch 0014.
 - **Earlier db281878 series** (on `main`): free after drain and admission reclaim (patch 0029) and image prompts in the prompt cache (patch 0030) by [tempeste](https://github.com/tempeste), now built
