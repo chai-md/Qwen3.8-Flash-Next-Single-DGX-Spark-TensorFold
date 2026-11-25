@@ -1,0 +1,250 @@
+diff --git a/zig/kernels/cuda/flashnext_batch.cu b/zig/kernels/cuda/flashnext_batch.cu
+index c52f183..0fec82e 100644
+--- a/zig/kernels/cuda/flashnext_batch.cu
++++ b/zig/kernels/cuda/flashnext_batch.cu
+@@ -156,9 +156,10 @@ static __device__ __forceinline__ void gdn_rows(
+     const size_t sbase = (size_t)hv * DV * DK;
+     float s[4][4];
+ #pragma unroll
+-    for (int j = 0; j < 4; ++j)
+-#pragma unroll
+-        for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (size_t)(row0 + j) * DK + lane * 4 + i];
++    for (int j = 0; j < 4; ++j) {
++        const float4 s4 = *reinterpret_cast<const float4*>(state_in + sbase + (size_t)(row0 + j) * DK + lane * 4);
++        s[j][0] = s4.x; s[j][1] = s4.y; s[j][2] = s4.z; s[j][3] = s4.w;
++    }
+     float kk[4], qq[4], vv[4], g = 0.0f, beta = 0.0f;
+     auto load = [&](int r, float (&k_)[4], float (&q_)[4], float (&v_)[4], float& g_, float& b_) {
+         const float4 k4 = *reinterpret_cast<const float4*>(kn + ((size_t)r * NK + hk) * DK + lane * 4);
+@@ -209,8 +210,8 @@ static __device__ __forceinline__ void gdn_rows(
+     }
+ #pragma unroll
+     for (int j = 0; j < 4; ++j)
+-#pragma unroll
+-        for (int i = 0; i < 4; ++i) state_out[sbase + (size_t)(row0 + j) * DK + lane * 4 + i] = s[j][i];
++        *reinterpret_cast<float4*>(state_out + sbase + (size_t)(row0 + j) * DK + lane * 4) =
++            make_float4(s[j][0], s[j][1], s[j][2], s[j][3]);
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows(
+@@ -238,16 +239,17 @@ static __device__ __forceinline__ void gdn_rows_late(
+     const unsigned first = *ctl & 0xffffu, np = *ctl >> 16;
+     float s[4][4];
+ #pragma unroll
+-    for (int j = 0; j < 4; ++j)
+-#pragma unroll
+-        for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (size_t)(row0 + j) * DK + lane * 4 + i];
++    for (int j = 0; j < 4; ++j) {
++        const float4 s4 = *reinterpret_cast<const float4*>(state_in + sbase + (size_t)(row0 + j) * DK + lane * 4);
++        s[j][0] = s4.x; s[j][1] = s4.y; s[j][2] = s4.z; s[j][3] = s4.w;
++    }
+     const unsigned total = np + (unsigned)rows;
+     for (unsigned p = 0; p < total; ++p) {
+         if (p == np && (int)np > store_above) {
+ #pragma unroll
+             for (int j = 0; j < 4; ++j)
+-#pragma unroll
+-                for (int i = 0; i < 4; ++i) state_in[sbase + (size_t)(row0 + j) * DK + lane * 4 + i] = s[j][i];
++                *reinterpret_cast<float4*>(state_in + sbase + (size_t)(row0 + j) * DK + lane * 4) =
++                    make_float4(s[j][0], s[j][1], s[j][2], s[j][3]);
+         }
+         const size_t lr = (first + p) % (unsigned)log_rows;
+         const float4 k4 = *reinterpret_cast<const float4*>(log + (lr * NK + hk) * DK + lane * 4);
+@@ -281,10 +283,12 @@ static __device__ __forceinline__ void gdn_rows_late(
+         }
+         if (lane == 0) *reinterpret_cast<float4*>(ys_out + ((size_t)r * NV + hv) * DV + row0) = make_float4(o4[0], o4[1], o4[2], o4[3]);
+     }
++    if (state_out != nullptr) {
+ #pragma unroll
+-    for (int j = 0; j < 4; ++j)
+-#pragma unroll
+-        for (int i = 0; i < 4; ++i) state_out[sbase + (size_t)(row0 + j) * DK + lane * 4 + i] = s[j][i];
++        for (int j = 0; j < 4; ++j)
++            *reinterpret_cast<float4*>(state_out + sbase + (size_t)(row0 + j) * DK + lane * 4) =
++                make_float4(s[j][0], s[j][1], s[j][2], s[j][3]);
++    }
+ }
+ 
+ extern "C" __global__ void __launch_bounds__(128) fn_gdn_rows_late(
+diff --git a/zig/src/families/flashnext/cuda_batch_gdn_lanes.zig b/zig/src/families/flashnext/cuda_batch_gdn_lanes.zig
+index 3dda982..ef0cf28 100644
+--- a/zig/src/families/flashnext/cuda_batch_gdn_lanes.zig
++++ b/zig/src/families/flashnext/cuda_batch_gdn_lanes.zig
+@@ -36,7 +36,6 @@ pub fn once(self: anytype, lw: *const Layer, layer: usize, li: usize) !bool {
+     for (self.lanes, t.l[0..self.lanes.len]) |l, *x| {
+         if (l.rows >= 64) return false;
+         const lk: LayerKeep = if (l.keep) |kp| kp.layers[layer] else .{};
+-        if (lk.log != 0 and lk.state_out == 0) return error.UnexpectedTensor;
+         const proj = s.proj + row0 * gdn.proj_width * 2;
+         for ([_]u64{ proj, l.seq.conv[li].ptr, lk.proj, lk.hist }) |p| if (p % 16 != 0) return false;
+         x.* = .{ .proj = proj, .conv = l.seq.conv[li].ptr, .state = l.seq.state[li].ptr, .state_out = lk.state_out, .log = lk.log, .ctl = lk.log_ctl, .keep_proj = lk.proj, .keep_hist = lk.hist, .row0 = @intCast(row0), .rows = @intCast(l.rows) };
+diff --git a/zig/src/families/flashnext/cuda_batch_gdn_lanes_test.zig b/zig/src/families/flashnext/cuda_batch_gdn_lanes_test.zig
+index d60f39b..1f5f18f 100644
+--- a/zig/src/families/flashnext/cuda_batch_gdn_lanes_test.zig
++++ b/zig/src/families/flashnext/cuda_batch_gdn_lanes_test.zig
+@@ -76,6 +76,10 @@ test "lanes' DeltaNet steps: one launch a step when the round fits, nothing laun
+     keep.layers[0] = .{ .proj = 0x600000, .hist = 0x700000, .state_out = 0x800000 };
+     const kept = pass(&d, round(&d, &conv, &state, ls[0..2], 9, &keep), 0x400000);
+     try expectOnce(&kept, &lw, true, 4); // and the rollback copies
++    var late_keep: parts.Keep = .{};
++    late_keep.layers[0] = .{ .proj = 0x600000, .hist = 0x700000, .log = 0x900000, .log_ctl = 0x910000, .state_out = 0 };
++    const late_kept = pass(&d, round(&d, &conv, &state, ls[0..2], 9, &late_keep), 0x400000);
++    try expectOnce(&late_kept, &lw, true, 4); // late log skips unused spare state_out writes
+ 
+     // fallbacks: false and no launch, so the caller's lane loop runs the round as before
+     const one = pass(&d, round(&d, &conv, &state, ls[0..1], 9, null), 0x400000);
+diff --git a/zig/src/families/flashnext/cuda_batch_late.zig b/zig/src/families/flashnext/cuda_batch_late.zig
+index dc557e7..59584bd 100644
+--- a/zig/src/families/flashnext/cuda_batch_late.zig
++++ b/zig/src/families/flashnext/cuda_batch_late.zig
+@@ -23,9 +23,8 @@ pub fn front(k: anytype, stream: cuda.Stream, lw: *const Layer, proj: u64, conv:
+     try cuda.launch.launch(k.front_log, .{ .grid = .{ .x = @intCast(rows), .y = gdn.nk + gdn.nv }, .block = .{ .x = 256 } }, stream, &f);
+ }
+ 
+-/// fn_gdn_rows_late: the pending rows on `state`, then the window's rows into ys, the end to keep.state_out.
++/// fn_gdn_rows_late: the pending rows on `state`, then the window's rows into ys, the end to keep.state_out (if non-zero).
+ pub fn chain(k: anytype, stream: cuda.Stream, gq: u64, keep: parts.LayerKeep, state: u64, rows: usize, ys: u64) !void {
+-    if (keep.state_out == 0) return error.UnexpectedTensor;
+     var a: cuda.Args = .{};
+     a.add(gq);
+     a.add(keep.log);
+diff --git a/zig/src/families/flashnext/cuda_batch_state.zig b/zig/src/families/flashnext/cuda_batch_state.zig
+index def247c..a6d563c 100644
+--- a/zig/src/families/flashnext/cuda_batch_state.zig
++++ b/zig/src/families/flashnext/cuda_batch_state.zig
+@@ -156,8 +156,8 @@ pub const Hooks = struct {
+ };
+ 
+ /// Rows a layer's pending-row log holds, and the pending count past which a chain stores its state in place.
+-pub const late_rows: usize = 48;
+-pub const late_store: usize = 12;
++pub const late_rows: usize = 64;
++pub const late_store: usize = 24;
+ /// One log row of a layer: k [nk, dk], v [nv, dv], decay and beta [nv, 2], fp32.
+ pub const late_row_bytes: usize = (gdn.nk * gdn.dk + gdn.nv * gdn.dv + gdn.nv * 2) * 4;
+ 
+diff --git a/zig/src/families/flashnext/cuda_mtp_draft.zig b/zig/src/families/flashnext/cuda_mtp_draft.zig
+index 120d88a..b3348eb 100644
+--- a/zig/src/families/flashnext/cuda_mtp_draft.zig
++++ b/zig/src/families/flashnext/cuda_mtp_draft.zig
+@@ -155,7 +155,8 @@ pub const Draft = struct {
+         const l = Layout.of(h);
+         const head = headBytes(cap, kv);
+         const log = if (late()) logBytes() else 0;
+-        return head + @max(rows, max_rows) * wide * 2 + wide * 2 + max_rows * vocab * 2 + draft_n * 2 + best_bytes + l.saved + linear_n * l.state + log;
++        const spares = if (late()) 0 else linear_n * l.state;
++        return head + @max(rows, max_rows) * wide * 2 + wide * 2 + max_rows * vocab * 2 + draft_n * 2 + best_bytes + l.saved + spares + log;
+     }
+ 
+     /// Drafting streams keep a partly kept window's DeltaNet rows pending (set at load; TF_FLASHNEXT_KEEP_LATE=0: off).
+@@ -241,7 +242,11 @@ pub const Draft = struct {
+         errdefer if (d.log) |*b| b.free();
+         var made: usize = 0;
+         errdefer for (d.spare[0..made]) |*b| b.free();
+-        while (made < linear_n) : (made += 1) d.spare[made] = try cuda.DeviceBuffer.alloc(driver, d.layout.state);
++        if (late()) {
++            for (&d.spare) |*b| b.* = .{ .d = driver, .ptr = 0, .len = 0, .borrowed = true };
++        } else {
++            while (made < linear_n) : (made += 1) d.spare[made] = try cuda.DeviceBuffer.alloc(driver, d.layout.state);
++        }
+         d.host = try gpa.alloc(u16, @max(max_rows * vocab, draft_n));
+         errdefer gpa.free(d.host);
+         errdefer cuda.completion.drain(driver, stream, "Flash Next draft fills did not drain before rollback");
+@@ -258,7 +263,7 @@ pub const Draft = struct {
+         const l = Layout.of(h);
+         var n: usize = 0;
+         for ([_]usize{ rows_cap * wide * 2, wide * 2, max_rows * vocab * 2, draft_n * 2, best_bytes, l.saved, if (late()) logBytes() else 0 }) |x| n += a(usize, x, 256);
+-        return n + linear_n * a(usize, l.state, 256);
++        return n + if (late()) 0 else linear_n * a(usize, l.state, 256);
+     }
+ 
+     /// init's draft whose fixed-size buffers (partsBytes) are zeroed views of `block`; its caches allocated as init's.
+@@ -300,8 +305,12 @@ pub const Draft = struct {
+         d.dlogits = Carve.take(driver, &at, draft_n * 2);
+         d.best = Carve.take(driver, &at, best_bytes);
+         d.saved = Carve.take(driver, &at, d.layout.saved);
+-        if (late()) d.log = Carve.take(driver, &at, logBytes());
+-        for (&d.spare) |*b| b.* = Carve.take(driver, &at, d.layout.state);
++        if (late()) {
++            d.log = Carve.take(driver, &at, logBytes());
++            for (&d.spare) |*b| b.* = .{ .d = driver, .ptr = 0, .len = 0, .borrowed = true };
++        } else {
++            for (&d.spare) |*b| b.* = Carve.take(driver, &at, d.layout.state);
++        }
+         std.debug.assert(at - block.ptr == bytes_in);
+         d.host = try gpa.alloc(u16, @max(max_rows * vocab, draft_n));
+         errdefer gpa.free(d.host);
+@@ -358,27 +367,36 @@ pub const Draft = struct {
+         d.dlogits = Carve.take(driver, &at, draft_n * 2);
+         d.best = Carve.take(driver, &at, best_bytes);
+         d.saved = Carve.take(driver, &at, d.layout.saved);
+-        if (late()) d.log = Carve.take(driver, &at, logBytes());
+-        for (&d.spare) |*b| b.* = Carve.take(driver, &at, d.layout.state);
++        if (late()) {
++            d.log = Carve.take(driver, &at, logBytes());
++            for (&d.spare) |*b| b.* = .{ .d = driver, .ptr = 0, .len = 0, .borrowed = true };
++        } else {
++            for (&d.spare) |*b| b.* = Carve.take(driver, &at, d.layout.state);
++        }
+         std.debug.assert(at - base <= len);
+         d.host = try gpa.alloc(u16, @max(max_rows * vocab, draft_n));
+         d.point();
+         return d;
+     }
+ 
+-    /// Each DeltaNet layer's window end state into its spare buffer.
++    /// Each DeltaNet layer's window end state into its spare buffer (0 when late log is active: skip unused spare write).
+     fn aim(d: *Draft) void {
+         var li: usize = 0;
+         for (&d.keep.layers, 0..) |*lk, layer| {
+             if (!wt.linearLayer(layer)) continue;
+-            lk.state_out = d.spare[li].ptr;
++            lk.state_out = if (d.log != null) 0 else d.spare[li].ptr;
+             li += 1;
+         }
+     }
+ 
+-    /// An open window kept whole: its end states become the sequence's (buffers swapped), no rows left pending.
++    /// An open window kept whole: with a late log, its rows stay pending without swapping spares; else swap spares in.
+     pub fn settle(d: *Draft, seq: *prompt.Seq) void {
+         if (!d.open) return;
++        if (d.log != null) {
++            d.keptLate(d.rows);
++            d.open = false;
++            return;
++        }
+         for (seq.state, &d.spare) |*a, *b| std.mem.swap(cuda.DeviceBuffer, a, b);
+         d.aim();
+         d.open = false;
+@@ -479,3 +497,31 @@ test "a head cache in fp8 takes 1,056 + 256 bytes a position, its pooled blocks
+     }
+     try std.testing.expectEqual(@as(usize, 1056 + 256), Draft.bytesKv(6, 1, 1, .full, .fp8) - Draft.bytesKv(5, 1, 1, .full, .fp8));
+ }
++
++test "late mode drops spare states from stream bytes and settles windows into pending rows" {
++    const before = Draft.late_on;
++    defer Draft.late_on = before;
++    Draft.late_on = false;
++    const without_late = Draft.bytesKv(4096, 79591, 64, .full, .fp8);
++    const parts_without = Draft.partsBytes(79591, 64, .full);
++    Draft.late_on = true;
++    const with_late = Draft.bytesKv(4096, 79591, 64, .full, .fp8);
++    const parts_with = Draft.partsBytes(79591, 64, .full);
++    const spares = linear_n * Draft.Layout.of(.full).state;
++    try std.testing.expectEqual(without_late - spares + Draft.logBytes(), with_late);
++    const a = std.mem.alignForward;
++    try std.testing.expectEqual(parts_without - linear_n * a(usize, Draft.Layout.of(.full).state, 256) + a(usize, Draft.logBytes(), 256), parts_with);
++    var d: Draft = undefined;
++    d.log = .{ .d = undefined, .ptr = 0x1000, .len = 256, .borrowed = true };
++    d.open = true;
++    d.rows = 9;
++    d.log_first = 0;
++    d.pending = 6;
++    var seq: prompt.Seq = undefined;
++    d.settle(&seq);
++    try std.testing.expect(!d.open);
++    try std.testing.expectEqual(@as(u32, 15), d.pending);
++    try std.testing.expectEqual(@as(u32, 0), d.log_first);
++    d.settle(&seq); // idempotent when not open
++    try std.testing.expectEqual(@as(u32, 15), d.pending);
++}
