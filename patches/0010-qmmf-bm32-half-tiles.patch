@@ -1,0 +1,190 @@
+diff --git a/zig/kernels/cuda/qmmf.cu b/zig/kernels/cuda/qmmf.cu
+--- a/zig/kernels/cuda/qmmf.cu
++++ b/zig/kernels/cuda/qmmf.cu
+@@ -81,6 +81,7 @@
+ }
+ TF_SHARED_DOWN(tf_qmmf_shared16_half, 16, 32)
+ TF_SHARED_DOWN(tf_qmmf_shared16, 16, 64)
++TF_SHARED_DOWN(tf_qmmf_shared32_half, 32, 32)
+ TF_SHARED_DOWN(tf_qmmf_shared32, 32, 64)
+ TF_SHARED_DOWN(tf_qmmf_shared64, 64, 64)
+ #undef TF_SHARED_DOWN
+@@ -95,6 +96,7 @@
+ }
+ TF_SHARED_DOWN_MX(tf_qmmf_shared16_half_mx, 16, 32)
+ TF_SHARED_DOWN_MX(tf_qmmf_shared16_mx, 16, 64)
++TF_SHARED_DOWN_MX(tf_qmmf_shared32_half_mx, 32, 32)
+ TF_SHARED_DOWN_MX(tf_qmmf_shared32_mx, 32, 64)
+ TF_SHARED_DOWN_MX(tf_qmmf_shared64_mx, 64, 64)
+ #undef TF_SHARED_DOWN_MX
+@@ -202,7 +204,7 @@
+ template __global__ void qmmf_kernel<BF16, 16, 64, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+ template __global__ void qmmf_kernel<BF16, 16, 64, 1, 4, 4, true, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+ 
+-// Half tiles (32 columns a block) of the 16-row tile: the 64-column tile's sums, twice the blocks for a small grid.
++// Half tiles (32 columns a block) of the 16-row and 32-row tiles: the 64-column tile's sums, twice the blocks for a small grid.
+ template __global__ void qmmf_kernel<MXFP8, 16, 32, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+ template __global__ void qmmf_kernel<MXFP8, 16, 32, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+ template __global__ void qmmf_kernel<MXFP8, 16, 32, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+@@ -211,6 +213,14 @@
+ template __global__ void qmmf_kernel<BF16, 16, 32, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+ template __global__ void qmmf_kernel<BF16, 16, 32, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+ template __global__ void qmmf_kernel<BF16, 16, 32, 1, 4, 4, true, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
++template __global__ void qmmf_kernel<MXFP8, 32, 32, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
++template __global__ void qmmf_kernel<MXFP8, 32, 32, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
++template __global__ void qmmf_kernel<MXFP8, 32, 32, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
++template __global__ void qmmf_kernel<MXFP8, 32, 32, 1, 4, 4, true, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
++template __global__ void qmmf_kernel<BF16, 32, 32, 1, 4, 4, false, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
++template __global__ void qmmf_kernel<BF16, 32, 32, 1, 4, 4, false, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
++template __global__ void qmmf_kernel<BF16, 32, 32, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
++template __global__ void qmmf_kernel<BF16, 32, 32, 1, 4, 4, true, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+ 
+ template __global__ void qmmf_kernel<BF16, 32, 64, 1, 4, 4, true, false, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+ template __global__ void qmmf_kernel<BF16, 32, 64, 1, 4, 4, true, true, false>(const __nv_bfloat16* __restrict__, const unsigned char* __restrict__, const uint8_t* __restrict__, float, void* __restrict__, float* __restrict__, int, int, int, int, int, int, int);
+diff --git a/zig/src/cuda/qmmf.zig b/zig/src/cuda/qmmf.zig
+--- a/zig/src/cuda/qmmf.zig
++++ b/zig/src/cuda/qmmf.zig
+@@ -102,19 +102,23 @@
+     return std.fmt.comptimePrint(name, .{ @backingInt(mode), bm, flags[0], flags[1], flags[2] });
+ }
+ 
+-/// The 16-row tile at 32 columns a block (MXFP8 and BF16): plain, then with a cluster.
+-fn halfSymbol(comptime mode: Mode, comptime cluster: bool, comptime wide: bool) [:0]const u8 {
+-    const name = "_ZN7tf_qmmf11qmmf_kernelILi{d}ELi16ELi32ELi1ELi4ELi4ELb{d}ELb{d}ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii";
+-    return std.fmt.comptimePrint(name, .{ @backingInt(mode), @intFromBool(wide), @intFromBool(cluster) });
+-}
+-
+-/// Dynamic shared bytes of the half tile: a stage holds half the weights (and scales) of the 64-column tile's.
+-pub fn halfShared(mode: Mode) u32 {
++/// The 16-row or 32-row tile at 32 columns a block (MXFP8 and BF16): plain, then with a cluster.
++fn halfSymbol(comptime mode: Mode, comptime bm: u32, comptime cluster: bool, comptime wide: bool) [:0]const u8 {
++    const name = "_ZN7tf_qmmf11qmmf_kernelILi{d}ELi{d}ELi32ELi1ELi4ELi4ELb{d}ELb{d}ELb0EEEvPK13__nv_bfloat16PKhS5_fPvPfiiiiiii";
++    return std.fmt.comptimePrint(name, .{ @backingInt(mode), bm, @intFromBool(wide), @intFromBool(cluster) });
++}
++
++/// Dynamic shared bytes of a BM-row half tile (BN = 32): a stage holds half the weights/scales of the 64-column tile's.
++pub fn halfSharedBm(mode: Mode, bm: u32) u32 {
+     const w: u32 = if (mode == .bf16) 32 * group * 2 else 32 * group;
+     const s: u32 = if (mode == .mxfp8) 32 * 2 else 0;
+-    const stage = (16 * group * 2 + w + s + 127) / 128 * 128;
+-    const partials = 1 * 1 * 4 * threads * 4;
++    const stage = (bm * group * 2 + w + s + 127) / 128 * 128;
++    const partials = (bm / 16) * 1 * 4 * threads * 4;
+     return @max(4 * stage, partials);
++}
++
++pub fn halfShared(mode: Mode) u32 {
++    return halfSharedBm(mode, 16);
+ }
+ 
+ /// MXFP8/BF16 decode calls take half tiles below this many 64-column blocks (TF_QMMF_HALF_BELOW; 0 never): same sums.
+@@ -188,10 +192,11 @@
+     fns: [modes.len][7]Function, // per mode: lane16, lane16c, lane32, lane32c, lane64, lane64c, fused
+     f32_fns: [modes.len][7]Function,
+     reduce: [2]Function, // by Out
+-    half: [2][2][2]Function, // by halfModeIndex, Out, then plain / cluster
++    half: [2][2][2]Function, // BM=16 half tile: by halfModeIndex, Out, then plain / cluster
++    half32: [2][2][2]Function = undefined, // BM=32 half tile: by halfModeIndex, Out, then plain / cluster
+     half_below: usize = half_below_default,
+-    shared_down: [4]Function = undefined,
+-    shared_down_mx: [4]Function = undefined,
++    shared_down: [5]Function = undefined,
++    shared_down_mx: [5]Function = undefined,
+     /// Output columns from which this lane fuses a split-K cluster call; 0 keeps its original schedule.
+     fuse_split_n: usize = 0,
+     fuse_s: [2][2][2]Function = undefined, // by halfModeIndex, Out, row tile 16 then 32: the fused form at decode rows
+@@ -222,9 +227,12 @@
+         }
+         for (&l.reduce, reduce_symbols) |*f, name| f.* = try mod.function(name);
+         inline for (.{ Mode.mxfp8, Mode.bf16 }, 0..) |mode, mi| inline for (.{ false, true }, 0..) |wide, oi| inline for (.{ false, true }, 0..) |cl, ci| {
+-            const f = try mod.function(halfSymbol(mode, cl, wide));
+-            try f.allowDynamicShared(halfShared(mode));
++            const f = try mod.function(halfSymbol(mode, 16, cl, wide));
++            try f.allowDynamicShared(halfSharedBm(mode, 16));
+             l.half[mi][oi][ci] = f;
++            const h32 = try mod.function(halfSymbol(mode, 32, cl, wide));
++            try h32.allowDynamicShared(halfSharedBm(mode, 32));
++            l.half32[mi][oi][ci] = h32;
+         };
+         for (@import("qmmf_shared.zig").symbols, &l.shared_down) |name, *f| {
+             f.* = try mod.function(name);
+@@ -360,8 +368,8 @@
+         const hm = halfModeIndex(w.mode);
+         // fuse_split_n: a cluster call this wide on the fused form (row tile 64: the fused instance), one block a tile
+         const fs = l.fuse_split_n != 0 and p.cluster and w.n >= l.fuse_split_n and hm != null;
+-        const half = hm != null and p.bm == 16 and !p.fused and !fs and rows_t * ((w.n + bn - 1) / bn) * p.sk < l.half_below;
+-        const f = if (k32) l.prompt_k32.?[@backingInt(out)] else if (prompt) l.prompt.?[@backingInt(out)][@intFromBool(p.fused)] else if (half) l.half[hm.?][@backingInt(out)][@intFromBool(p.cluster)] else if (fs) (if (p.bm == 64) set[6] else l.fuse_s[hm.?][@backingInt(out)][@intFromBool(p.bm == 32)]) else if (p.fused) set[6] else set[ti * 2 + @intFromBool(p.cluster)];
++        const half = hm != null and (p.bm == 16 or p.bm == 32) and !p.fused and !fs and rows_t * ((w.n + bn - 1) / bn) * p.sk < l.half_below;
++        const f = if (k32) l.prompt_k32.?[@backingInt(out)] else if (prompt) l.prompt.?[@backingInt(out)][@intFromBool(p.fused)] else if (half) (if (p.bm == 32) l.half32[hm.?][@backingInt(out)][@intFromBool(p.cluster)] else l.half[hm.?][@backingInt(out)][@intFromBool(p.cluster)]) else if (fs) (if (p.bm == 64) set[6] else l.fuse_s[hm.?][@backingInt(out)][@intFromBool(p.bm == 32)]) else if (p.fused) set[6] else set[ti * 2 + @intFromBool(p.cluster)];
+         const cols: usize = if (prompt) 128 else if (half) 32 else bn;
+         const band = @max(1, @min(rows_t, (12 << 20) / (bm * w.k * 2)));
+         var args: launch_.Args = .{};
+@@ -381,7 +389,7 @@
+         try launch_.launch(f, .{
+             .grid = .{ .x = @intCast(rows_t * ((w.n + cols - 1) / cols)), .y = 1, .z = if (p.fused or fs) 1 else p.sk },
+             .block = .{ .x = if (prompt) 256 else threads, .y = 1, .z = 1 },
+-            .shared = if (k32) prompt_k32_shared else if (prompt) prompt_shared else if (half) halfShared(w.mode) else sharedBytes(w.mode, p.bm),
++            .shared = if (k32) prompt_k32_shared else if (prompt) prompt_shared else if (half) halfSharedBm(w.mode, p.bm) else sharedBytes(w.mode, p.bm),
+             .cluster = if (p.cluster and !fs) .{ .x = 1, .y = 1, .z = p.sk } else null,
+             .pdl = l.pdl and !prompt, // the prompt entries do not wait
+         }, s, &args);
+diff --git a/zig/src/cuda/qmmf_shared.zig b/zig/src/cuda/qmmf_shared.zig
+--- a/zig/src/cuda/qmmf_shared.zig
++++ b/zig/src/cuda/qmmf_shared.zig
+@@ -2,8 +2,8 @@
+ const q = @import("qmmf.zig");
+ const launch = @import("launch.zig");
+ const Stream = @import("stream.zig").Stream;
+-pub const symbols = [4][:0]const u8{ "tf_qmmf_shared16_half", "tf_qmmf_shared16", "tf_qmmf_shared32", "tf_qmmf_shared64" };
+-pub const mx_symbols = [4][:0]const u8{ "tf_qmmf_shared16_half_mx", "tf_qmmf_shared16_mx", "tf_qmmf_shared32_mx", "tf_qmmf_shared64_mx" };
++pub const symbols = [5][:0]const u8{ "tf_qmmf_shared16_half", "tf_qmmf_shared16", "tf_qmmf_shared32_half", "tf_qmmf_shared32", "tf_qmmf_shared64" };
++pub const mx_symbols = [5][:0]const u8{ "tf_qmmf_shared16_half_mx", "tf_qmmf_shared16_mx", "tf_qmmf_shared32_half_mx", "tf_qmmf_shared32_mx", "tf_qmmf_shared64_mx" };
+ 
+ /// The launch takes it: BF16 or MXFP8 (with scales), one K slice, a shape and strides (`ldx` in, `ldy` out) it addresses; else fall back.
+ pub fn eligible(l: q.Lane, m: usize, w: q.Weight, ldx: usize, ldy: usize) bool {
+@@ -16,8 +16,8 @@
+     if (!eligible(l, m, w, ldx, ldy)) return error.StridedLaneNotSupported;
+     const bm: usize = q.bucket(m);
+     const rows = (m + bm - 1) / bm;
+-    const half = bm == 16 and rows * ((w.n + 63) / 64) < l.half_below;
+-    const index: usize = if (half) 0 else if (bm == 16) 1 else if (bm == 32) 2 else 3;
++    const half = (bm == 16 or bm == 32) and rows * ((w.n + 63) / 64) < l.half_below;
++    const index: usize = if (bm == 16) (if (half) 0 else 1) else if (bm == 32) (if (half) 2 else 3) else 4;
+     const cols: usize = if (half) 32 else 64;
+     const band = @max(1, @min(rows, (12 << 20) / (bm * w.k * 2)));
+     const is_mx = w.mode == .mxfp8;
+@@ -31,7 +31,7 @@
+     try launch.launch(if (is_mx) l.shared_down_mx[index] else l.shared_down[index], .{
+         .grid = .{ .x = @intCast(rows * ((w.n + cols - 1) / cols)) },
+         .block = .{ .x = 128 },
+-        .shared = if (half) q.halfShared(w.mode) else q.sharedBytes(w.mode, @intCast(bm)),
++        .shared = if (half) q.halfSharedBm(w.mode, @intCast(bm)) else q.sharedBytes(w.mode, @intCast(bm)),
+     }, s, &a);
+ }
+ 
+@@ -64,21 +64,21 @@
+     for (&l.shared_down_mx, 0..) |*f, i| f.* = .{ .d = &d, .handle = @ptrFromInt(201 + i) };
+     const s: Stream = .{ .d = &d, .handle = null };
+     const w: q.Weight = .{ .mode = .bf16, .codes = 11, .scales = 0, .n = 2560, .k = 640, .npad = 2560 };
+-    for ([_]usize{ 1, 16, 17, 32, 64, 65, 4218 }, [_]usize{ 0, 0, 2, 2, 3, 3, 3 }) |rows, i| {
++    for ([_]usize{ 1, 16, 17, 32, 64, 65, 4218 }, [_]usize{ 0, 0, 2, 2, 4, 4, 4 }) |rows, i| {
+         try l.matmulF32Strided(s, 12, 640, rows, w, 1000, 28160);
+         try std.testing.expectEqual(101 + i, Mock.id);
+         try std.testing.expectEqual(@as(i32, 28160), Mock.stride);
+         try std.testing.expectEqual(@as(u64, 1000), Mock.dest);
+-        try std.testing.expectEqual(if (i == 0) q.halfShared(.bf16) else q.sharedBytes(.bf16, q.bucket(rows)), Mock.smem);
++        try std.testing.expectEqual(if (i == 0 or i == 2) q.halfSharedBm(.bf16, q.bucket(rows)) else q.sharedBytes(.bf16, q.bucket(rows)), Mock.smem);
+     }
+     const w_mx: q.Weight = .{ .mode = .mxfp8, .codes = 11, .scales = 77, .n = 4096, .k = 512, .npad = 4096 };
+-    for ([_]usize{ 1, 16, 17, 32, 64, 8192 }, [_]usize{ 0, 0, 2, 2, 3, 3 }) |rows, i| {
++    for ([_]usize{ 1, 16, 17, 32, 64, 8192 }, [_]usize{ 0, 0, 2, 2, 4, 4 }) |rows, i| {
+         try l.matmulF32Strided(s, 12, 512, rows, w_mx, 2000, 45056);
+         try std.testing.expectEqual(201 + i, Mock.id);
+         try std.testing.expectEqual(@as(u64, 77), Mock.scales);
+         try std.testing.expectEqual(@as(i32, 45056), Mock.stride);
+         try std.testing.expectEqual(@as(u64, 2000), Mock.dest);
+-        try std.testing.expectEqual(if (i == 0) q.halfShared(.mxfp8) else q.sharedBytes(.mxfp8, q.bucket(rows)), Mock.smem);
++        try std.testing.expectEqual(if (i == 0 or i == 2) q.halfSharedBm(.mxfp8, q.bucket(rows)) else q.sharedBytes(.mxfp8, q.bucket(rows)), Mock.smem);
+     }
+     var other = w;
+     other.mode = .mxfp8; // missing scales (0) is refused
