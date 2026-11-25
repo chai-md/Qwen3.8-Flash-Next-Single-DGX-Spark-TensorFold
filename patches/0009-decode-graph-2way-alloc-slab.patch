@@ -1,0 +1,384 @@
+diff --git a/zig/src/families/flashnext/cuda_window_graph.zig b/zig/src/families/flashnext/cuda_window_graph.zig
+--- a/zig/src/families/flashnext/cuda_window_graph.zig
++++ b/zig/src/families/flashnext/cuda_window_graph.zig
+@@ -6,8 +6,12 @@
+ 
+ // A key holds every host value its kernels take; uploads stay outside the graph (stageWindow); caches clear on realloc.
+ 
+-/// Graphs a cache holds at most; past it the cache starts over (finished sequences' graphs stay until then).
+-const max_graphs = 128;
++/// Graph slots a cache holds at most (each slot keeps up to `ways` moving keys, e.g. Draft.settle A/B state swaps).
++const max_slots = 64;
++const ways: usize = 2;
++comptime {
++    std.debug.assert(ways == 2);
++}
+ 
+ var gens = std.atomic.Value(u64).init(1);
+ 
+@@ -206,9 +210,14 @@
+ pub fn Cache(comptime K: type) type {
+     return struct {
+         const Self = @This();
+-        /// A held graph and the whole key it was last recorded for; the map holds it under its slot (slotOf).
++        /// A held graph and the whole key it was last recorded for.
+         const Held = struct { key: K, exec: cuda.graph.Exec };
+-        map: std.AutoHashMapUnmanaged(K, Held) = .empty,
++        /// Up to `ways` LRU entries under one shape slot (entries[0] is MRU), preventing A/B thrash on Draft.settle swaps.
++        const Slot = struct {
++            entries: [ways]Held = undefined,
++            len: u8 = 0,
++        };
++        map: std.AutoHashMapUnmanaged(K, Slot) = .empty,
+         /// Slots run once eagerly and are captured the second time (a one-off pass would never pay its capture back).
+         seen: std.AutoHashMapUnmanaged(K, void) = .empty,
+         captures: u64 = 0,
+@@ -220,7 +229,9 @@
+ 
+         pub fn clear(c: *Self, gpa: std.mem.Allocator) void {
+             var it = c.map.valueIterator();
+-            while (it.next()) |h| h.exec.deinit();
++            while (it.next()) |s| {
++                for (s.entries[0..s.len]) |*h| h.exec.deinit();
++            }
+             c.map.clearAndFree(gpa);
+             c.seen.clearAndFree(gpa);
+         }
+@@ -229,27 +240,43 @@
+         pub fn run(c: *Self, gpa: std.mem.Allocator, stream: cuda.Stream, key: K, pass: anytype) !void {
+             if (c.off) return pass.run();
+             const slot = slotOf(key);
+-            if (c.map.getPtr(slot)) |h| {
+-                if (std.meta.eql(h.key, key)) {
+-                    c.replays += 1;
+-                    return h.exec.launchOn(stream);
++            if (c.map.getPtr(slot)) |s| {
++                for (s.entries[0..s.len], 0..) |*h, i| {
++                    if (std.meta.eql(h.key, key)) {
++                        if (i != 0) std.mem.swap(Held, &s.entries[0], &s.entries[i]);
++                        c.replays += 1;
++                        return s.entries[0].exec.launchOn(stream);
++                    }
+                 }
+-                // the same pass at another length, sequence or lane: recorded again, the held graph updated in place
+-                refresh(stream, pass, &h.exec) catch |err| return c.fail(err, pass);
+-                h.key = key;
++                if (s.len < ways) {
++                    const exec = capture(stream, pass) catch |err| return c.fail(err, pass);
++                    s.entries[1] = s.entries[0];
++                    s.entries[0] = .{ .key = key, .exec = exec };
++                    s.len = 2;
++                    c.captures += 1;
++                    if (c.captures % 64 == 1) std.log.info("{s} graphs: {d} captured, {d} updated, {d} replayed, {d} slots", .{ @typeName(K), c.captures, c.updates, c.replays, c.map.count() });
++                    return s.entries[0].exec.launchOn(stream);
++                }
++                // Evict/refresh the LRU entry in place so the MRU partner stays cached for A/B alternation.
++                const lru = ways - 1;
++                refresh(stream, pass, &s.entries[lru].exec) catch |err| return c.fail(err, pass);
++                s.entries[lru].key = key;
++                std.mem.swap(Held, &s.entries[0], &s.entries[lru]);
+                 c.updates += 1;
+-                return h.exec.launchOn(stream);
++                return s.entries[0].exec.launchOn(stream);
+             }
+-            if (c.map.count() >= max_graphs or c.seen.count() >= 4 * max_graphs) c.clear(gpa);
++            if (c.map.count() >= max_slots or c.seen.count() >= 4 * max_slots) c.clear(gpa);
+             if (!c.seen.contains(slot)) {
+                 try c.seen.put(gpa, slot, {});
+                 return pass.run();
+             }
+             var exec = capture(stream, pass) catch |err| return c.fail(err, pass);
+             errdefer exec.deinit();
+-            try c.map.put(gpa, slot, .{ .key = key, .exec = exec });
++            var entry: Slot = .{ .len = 1 };
++            entry.entries[0] = .{ .key = key, .exec = exec };
++            try c.map.put(gpa, slot, entry);
+             c.captures += 1;
+-            if (c.captures % 64 == 1) std.log.info("{s} graphs: {d} captured, {d} updated, {d} replayed, {d} held", .{ @typeName(K), c.captures, c.updates, c.replays, c.map.count() });
++            if (c.captures % 64 == 1) std.log.info("{s} graphs: {d} captured, {d} updated, {d} replayed, {d} slots", .{ @typeName(K), c.captures, c.updates, c.replays, c.map.count() });
+             try exec.launchOn(stream);
+         }
+ 
+diff --git a/zig/src/families/flashnext/cuda_window_graph_test.zig b/zig/src/families/flashnext/cuda_window_graph_test.zig
+--- a/zig/src/families/flashnext/cuda_window_graph_test.zig
++++ b/zig/src/families/flashnext/cuda_window_graph_test.zig
+@@ -93,19 +93,22 @@
+     try expectAfter(&c, stream, key(1, 3, 7), .{ 0, 0, 0, 1, 0 }); // a new slot runs eagerly once
+     try expectAfter(&c, stream, key(1, 3, 7), .{ 1, 1, 0, 1, 1 }); // then is captured
+     try expectAfter(&c, stream, key(1, 3, 7), .{ 1, 1, 0, 1, 2 }); // and replayed
+-    try expectAfter(&c, stream, key(2, 3, 7), .{ 2, 1, 1, 1, 3 }); // new values (a length, a request, a lane): updated
+-    try expectAfter(&c, stream, key(3, 3, 7), .{ 3, 1, 2, 1, 4 });
+-    try expectAfter(&c, stream, key(3, 3, 7), .{ 3, 1, 2, 1, 5 });
++    try expectAfter(&c, stream, key(2, 3, 7), .{ 2, 2, 0, 1, 3 }); // 2nd way captured (e.g. Draft.settle state swap)
++    try expectAfter(&c, stream, key(1, 3, 7), .{ 2, 2, 0, 1, 4 }); // A/B alternation replays with 0 updates
++    try expectAfter(&c, stream, key(2, 3, 7), .{ 2, 2, 0, 1, 5 }); // both ways stay hot
++    try expectAfter(&c, stream, key(3, 3, 7), .{ 3, 2, 1, 1, 6 }); // 3rd moving key refreshes LRU (key 1)
++    try expectAfter(&c, stream, key(2, 3, 7), .{ 3, 2, 1, 1, 7 }); // MRU partner (key 2) still replays
++    try expectAfter(&c, stream, key(3, 3, 7), .{ 3, 2, 1, 1, 8 }); // key 3 replays
+     Fake.verdict = .topology_changed;
+-    try expectAfter(&c, stream, key(4, 3, 7), .{ 4, 2, 3, 1, 6 }); // other launches: a new executable, the old freed
++    try expectAfter(&c, stream, key(4, 3, 7), .{ 4, 3, 2, 1, 9 }); // other launches: a new executable, LRU freed
+     try t.expectEqual(@as(usize, 1), Fake.destroyed);
+     Fake.verdict = .success;
+-    try expectAfter(&c, stream, key(4, 3, 7), .{ 4, 2, 3, 1, 7 });
+-    try expectAfter(&c, stream, key(4, 4, 7), .{ 4, 2, 3, 2, 7 }); // another row count is another slot
+-    try expectAfter(&c, stream, key(4, 3, 8), .{ 4, 2, 3, 3, 7 }); // and another shape
+-    try t.expectEqual([3]u64{ 1, 3, 3 }, [3]u64{ c.captures, c.updates, c.replays });
++    try expectAfter(&c, stream, key(4, 3, 7), .{ 4, 3, 2, 1, 10 });
++    try expectAfter(&c, stream, key(4, 4, 7), .{ 4, 3, 2, 2, 10 }); // another row count is another slot
++    try expectAfter(&c, stream, key(4, 3, 8), .{ 4, 3, 2, 3, 10 }); // and another shape
++    try t.expectEqual([3]u64{ 2, 2, 6 }, [3]u64{ c.captures, c.updates, c.replays });
+     c.clear(t.allocator);
+-    try t.expectEqual(@as(usize, 2), Fake.destroyed);
++    try t.expectEqual(@as(usize, 3), Fake.destroyed);
+ }
+ 
+ const Buf = struct { ptr: u64 };
+diff --git a/zig/src/families/flashnext/cuda_prompt.zig b/zig/src/families/flashnext/cuda_prompt.zig
+--- a/zig/src/families/flashnext/cuda_prompt.zig
++++ b/zig/src/families/flashnext/cuda_prompt.zig
+@@ -326,10 +326,12 @@
+         seq.state = try zeros(e.gpa, e.driver, e.stream.*, linear_n, sizes.stateBytes(e.heads));
+         // --kv-cache fp8 rows are contiguous and whole-layer (one rank): cuda_lanes_load.zig refuses pages and --tp with it
+         if (e.kv == .fp8 and (seq.paged != null or !e.heads.eql(.full))) return error.KvCacheFp8Unsupported;
+-        seq.kc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .key) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, if (e.kv == .fp8) cap * e.kv.keyRow() else sizes.kvBytes(cap, e.heads));
+-        seq.vc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .value) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, if (e.kv == .fp8) cap * e.kv.valueRow() else sizes.kvBytes(cap, e.heads));
+-        seq.ikc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .index) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.indexBytes(cap));
+-        seq.pooled = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .pooled) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, pooledBytes(cap));
++        if (seq.paged) |*p| {
++            seq.kc = try p.views(e.gpa, e.driver, .key);
++            seq.vc = try p.views(e.gpa, e.driver, .value);
++            seq.ikc = try p.views(e.gpa, e.driver, .index);
++            seq.pooled = try p.views(e.gpa, e.driver, .pooled);
++        } else try @import("cuda_seq_parts.zig").allocKvSlab(e, &seq, cap);
+         seq.tail = try cuda.DeviceBuffer.alloc(e.driver, ple_tail_n * wide * 2);
+         try seq.tail.fill8(0, e.stream.handle);
+         return seq;
+@@ -497,6 +499,8 @@
+     pooled: []cuda.DeviceBuffer,
+     /// kc, vc, ikc and pooled as borrowed views of page 0 of these pages (null: each its own contiguous buffer).
+     paged: ?pages.Paged = null,
++    /// Single owning slab backing contiguous kc, vc, ikc and pooled views (null when paged or separately owned).
++    kv_slab: ?cuda.DeviceBuffer = null,
+     tail: cuda.DeviceBuffer,
+     history: [2]i64,
+     fed: usize,
+@@ -533,6 +537,7 @@
+         gpa.free(s.ikc);
+         gpa.free(s.pooled);
+         if (s.paged) |*p| p.deinit(gpa);
++        if (s.kv_slab) |*b| b.free();
+         if (s.tail.ptr != 0) s.tail.free();
+         gpa.free(s.logits);
+     }
+diff --git a/zig/src/families/flashnext/cuda_seq_parts.zig b/zig/src/families/flashnext/cuda_seq_parts.zig
+--- a/zig/src/families/flashnext/cuda_seq_parts.zig
++++ b/zig/src/families/flashnext/cuda_seq_parts.zig
+@@ -32,7 +32,27 @@
+     return b;
+ }
+ 
+-/// A contiguous sequence whose conv windows, states and tail are views of `block` (zeroed here); its caches its own.
++/// Allocate one 256-byte-aligned device slab for all 12 layers' contiguous kc, vc, ikc, and pooled caches,
++/// zero it in one cuMemsetD8Async, and populate seq's arrays with borrowed views.
++pub fn allocKvSlab(e: *Engine, seq: *Seq, cap: usize) !void {
++    const a = std.mem.alignForward;
++    const kc_len = if (e.kv == .fp8) cap * e.kv.keyRow() else sizes.kvBytes(cap, e.heads);
++    const vc_len = if (e.kv == .fp8) cap * e.kv.valueRow() else sizes.kvBytes(cap, e.heads);
++    const ikc_len = sizes.indexBytes(cap);
++    const pooled_len = sizes.pooledBytes(cap);
++    const total = attn_n * (a(usize, kc_len, 256) + a(usize, vc_len, 256) + a(usize, ikc_len, 256) + a(usize, pooled_len, 256));
++    const slab = try cuda.DeviceBuffer.alloc(e.driver, total);
++    seq.kv_slab = slab;
++    try slab.fill8(0, e.stream.handle);
++    var at = slab.ptr;
++    seq.kc = try viewsAt(e.gpa, e.driver, &at, attn_n, kc_len);
++    seq.vc = try viewsAt(e.gpa, e.driver, &at, attn_n, vc_len);
++    seq.ikc = try viewsAt(e.gpa, e.driver, &at, attn_n, ikc_len);
++    seq.pooled = try viewsAt(e.gpa, e.driver, &at, attn_n, pooled_len);
++    std.debug.assert(at - slab.ptr == total);
++}
++
++/// A contiguous sequence whose conv windows, states and tail are views of `block` (zeroed here); its caches in one slab.
+ pub fn newSeqIn(e: *Engine, cap: usize, block: cuda.DeviceBuffer) !Seq {
+     if (block.len < seqPartsBytes(e.heads)) return error.UnexpectedTensor;
+     e.round_graph.clear();
+@@ -64,9 +84,6 @@
+     seq.conv = try viewsAt(e.gpa, e.driver, &at, linear_n, sizes.convBytes(e.heads));
+     seq.state = try viewsAt(e.gpa, e.driver, &at, linear_n, sizes.stateBytes(e.heads));
+     seq.tail = viewAt(e.driver, &at, ple_tail_n * wide * 2);
+-    seq.kc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, if (e.kv == .fp8) cap * e.kv.keyRow() else sizes.kvBytes(cap, e.heads));
+-    seq.vc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, if (e.kv == .fp8) cap * e.kv.valueRow() else sizes.kvBytes(cap, e.heads));
+-    seq.ikc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.indexBytes(cap));
+-    seq.pooled = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.pooledBytes(cap));
++    try allocKvSlab(e, &seq, cap);
+     return seq;
+ }
+diff --git a/zig/src/families/flashnext/cuda_mtp_draft.zig b/zig/src/families/flashnext/cuda_mtp_draft.zig
+--- a/zig/src/families/flashnext/cuda_mtp_draft.zig
++++ b/zig/src/families/flashnext/cuda_mtp_draft.zig
+@@ -72,6 +72,8 @@
+     kv: kv_format.Kv = .bf16,
+     /// Its pooled indexer keys [cap / 4, 128] bf16, for sparse attention past 2,048 keys (Python State.mtp_pooled).
+     pooled: cuda.DeviceBuffer,
++    /// Single owning slab backing contiguous kc, vc, ikc and pooled views (null for pooled lanes).
++    kv_slab: ?cuda.DeviceBuffer = null,
+     /// The cache's pages (a pool lane's: its stream's, the layer after the model's), or contiguous.
+     pg: @import("cuda_glue.zig").Pg = .{},
+     /// Entries the head's cache holds (Python mtp_len), the last `drafted` of them a chain's.
+@@ -201,14 +203,28 @@
+     /// init with the head's cache in format `kv`.
+     pub fn initKv(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, cap: usize, draft_n: usize, rows: usize, h: Heads, kv: kv_format.Kv) !Draft {
+         var d: Draft = .{ .gen = @import("cuda_window_graph.zig").nextGen(), .stream = stream, .gpa = gpa, .cap = cap, .kv = kv, .rows_cap = @max(rows, max_rows), .kc = undefined, .vc = undefined, .ikc = undefined, .pooled = undefined, .streams = undefined, .out = undefined, .logits = undefined, .dlogits = undefined, .best = undefined, .saved = undefined, .host = undefined, .layout = .of(h) };
+-        d.kc = try cuda.DeviceBuffer.alloc(driver, cap * keyRow(kv));
+-        errdefer d.kc.free();
+-        d.vc = try cuda.DeviceBuffer.alloc(driver, cap * valueRow(kv));
+-        errdefer d.vc.free();
+-        d.ikc = try cuda.DeviceBuffer.alloc(driver, sizes.indexBytes(cap));
+-        errdefer d.ikc.free();
+-        d.pooled = try cuda.DeviceBuffer.alloc(driver, sizes.pooledBytes(cap));
+-        errdefer d.pooled.free();
++        const a = std.mem.alignForward;
++        const kc_len = cap * keyRow(kv);
++        const vc_len = cap * valueRow(kv);
++        const ikc_len = sizes.indexBytes(cap);
++        const pooled_len = sizes.pooledBytes(cap);
++        const kv_total = a(usize, kc_len, 256) + a(usize, vc_len, 256) + a(usize, ikc_len, 256) + a(usize, pooled_len, 256);
++        const slab = try cuda.DeviceBuffer.alloc(driver, kv_total);
++        d.kv_slab = slab;
++        errdefer if (d.kv_slab) |*b| b.free();
++        const Carve = struct {
++            fn take(dr: *const cuda.Driver, p: *u64, n: usize) cuda.DeviceBuffer {
++                const b: cuda.DeviceBuffer = .{ .d = dr, .ptr = p.*, .len = n, .borrowed = true };
++                p.* += std.mem.alignForward(usize, n, 256);
++                return b;
++            }
++        };
++        var kv_at = slab.ptr;
++        d.kc = Carve.take(driver, &kv_at, kc_len);
++        d.vc = Carve.take(driver, &kv_at, vc_len);
++        d.ikc = Carve.take(driver, &kv_at, ikc_len);
++        d.pooled = Carve.take(driver, &kv_at, pooled_len);
++        std.debug.assert(kv_at - slab.ptr == kv_total);
+         d.streams = try cuda.DeviceBuffer.alloc(driver, d.rows_cap * wide * 2);
+         errdefer d.streams.free();
+         d.out = try cuda.DeviceBuffer.alloc(driver, wide * 2);
+@@ -230,7 +246,7 @@
+         errdefer gpa.free(d.host);
+         errdefer cuda.completion.drain(driver, stream, "Flash Next draft fills did not drain before rollback");
+         // zeroed on the compute stream, ahead of the passes that read them
+-        for ([_]cuda.DeviceBuffer{ d.kc, d.vc, d.ikc, d.pooled }) |b| try b.fill8(0, stream.handle);
++        try slab.fill8(0, stream.handle);
+         d.point();
+         return d;
+     }
+@@ -255,14 +271,15 @@
+         const bytes_in = partsBytes(draft_n, rows, h);
+         if (block.len < bytes_in) return error.FlashNextRunTooShort;
+         var d: Draft = .{ .gen = @import("cuda_window_graph.zig").nextGen(), .stream = stream, .gpa = gpa, .cap = cap, .kv = kv, .rows_cap = @max(rows, max_rows), .kc = undefined, .vc = undefined, .ikc = undefined, .pooled = undefined, .streams = undefined, .out = undefined, .logits = undefined, .dlogits = undefined, .best = undefined, .saved = undefined, .spare = undefined, .host = undefined, .layout = .of(h) };
+-        d.kc = try cuda.DeviceBuffer.alloc(driver, cap * keyRow(kv));
+-        errdefer d.kc.free();
+-        d.vc = try cuda.DeviceBuffer.alloc(driver, cap * valueRow(kv));
+-        errdefer d.vc.free();
+-        d.ikc = try cuda.DeviceBuffer.alloc(driver, sizes.indexBytes(cap));
+-        errdefer d.ikc.free();
+-        d.pooled = try cuda.DeviceBuffer.alloc(driver, sizes.pooledBytes(cap));
+-        errdefer d.pooled.free();
++        const a = std.mem.alignForward;
++        const kc_len = cap * keyRow(kv);
++        const vc_len = cap * valueRow(kv);
++        const ikc_len = sizes.indexBytes(cap);
++        const pooled_len = sizes.pooledBytes(cap);
++        const kv_total = a(usize, kc_len, 256) + a(usize, vc_len, 256) + a(usize, ikc_len, 256) + a(usize, pooled_len, 256);
++        const slab = try cuda.DeviceBuffer.alloc(driver, kv_total);
++        d.kv_slab = slab;
++        errdefer if (d.kv_slab) |*b| b.free();
+         const Carve = struct {
+             fn take(dr: *const cuda.Driver, p: *u64, n: usize) cuda.DeviceBuffer {
+                 const b: cuda.DeviceBuffer = .{ .d = dr, .ptr = p.*, .len = n, .borrowed = true };
+@@ -270,6 +287,12 @@
+                 return b;
+             }
+         };
++        var kv_at = slab.ptr;
++        d.kc = Carve.take(driver, &kv_at, kc_len);
++        d.vc = Carve.take(driver, &kv_at, vc_len);
++        d.ikc = Carve.take(driver, &kv_at, ikc_len);
++        d.pooled = Carve.take(driver, &kv_at, pooled_len);
++        std.debug.assert(kv_at - slab.ptr == kv_total);
+         var at = block.ptr;
+         d.streams = Carve.take(driver, &at, d.rows_cap * wide * 2);
+         d.out = Carve.take(driver, &at, wide * 2);
+@@ -283,7 +306,7 @@
+         d.host = try gpa.alloc(u16, @max(max_rows * vocab, draft_n));
+         errdefer gpa.free(d.host);
+         errdefer cuda.completion.drain(driver, stream, "Flash Next draft fills did not drain before rollback");
+-        for ([_]cuda.DeviceBuffer{ d.kc, d.vc, d.ikc, d.pooled }) |b| try b.fill8(0, stream.handle);
++        try slab.fill8(0, stream.handle);
+         try stream.d.check(stream.d.api.cuMemsetD8Async(block.ptr, 0, bytes_in, stream.handle), "cuMemsetD8Async");
+         d.point();
+         return d;
+@@ -378,6 +401,7 @@
+         d.ikc.free();
+         d.vc.free();
+         d.kc.free();
++        if (d.kv_slab) |*b| b.free();
+     }
+ 
+     /// Drop the head's cache (a new prompt).
+diff --git a/zig/src/families/flashnext/cuda_sequence_completion_test.zig b/zig/src/families/flashnext/cuda_sequence_completion_test.zig
+--- a/zig/src/families/flashnext/cuda_sequence_completion_test.zig
++++ b/zig/src/families/flashnext/cuda_sequence_completion_test.zig
+@@ -88,8 +88,8 @@
+     const old_limit = try cuda.memory.setAllocationLimit(null);
+     defer _ = cuda.memory.setAllocationLimit(old_limit) catch unreachable;
+     const before = cuda.usage(false);
+-    // Cover failures inside each array and between arrays, including after the last pooled fill.
+-    for ([_]usize{ 1, 2, 35, 36, 37, 71, 72, 73, 83, 84, 85, 95, 96, 97, 107, 108, 109, 119, 120 }) |deny| {
++    // Cover failures inside each array and between arrays, including after the coalesced KV slab fill.
++    for ([_]usize{ 1, 2, 35, 36, 37, 71, 72, 73 }) |deny| {
+         var d = Fake.init(deny, 0);
+         var stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(325) };
+         var e: prompt.Engine = undefined;
+@@ -99,6 +99,7 @@
+         e.eos = 1;
+         e.round_graph = .{};
+         e.heads = .full;
++        e.kv = .bf16;
+         try t.expectError(error.OutOfDeviceMemory, e.newSeq(4));
+         _ = try cuda.memory.setAllocationLimit(null);
+         try t.expectEqual(deny, Fake.allocations);
+@@ -111,7 +112,7 @@
+ }
+ 
+ test "Flash Next completion: failed asynchronous fill and an interrupted prefill both drain before release" {
+-    for ([_]usize{ 1, 37, 73, 121 }) |fail_fill| {
++    for ([_]usize{ 1, 37, 73, 74 }) |fail_fill| {
+         var d = Fake.init(0, fail_fill);
+         var stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(326) };
+         var e: prompt.Engine = undefined;
+@@ -121,6 +122,7 @@
+         e.eos = 1;
+         e.round_graph = .{};
+         e.heads = .full;
++        e.kv = .bf16;
+         try t.expectError(error.NotReady, e.newSeq(4));
+         try t.expectEqual(Fake.allocations, Fake.frees);
+         if (Fake.early != 0) std.log.warn("completion control: allocs={d}, fills={d}, frees={d}, syncs={d}", .{ Fake.allocations, Fake.fills, Fake.frees, Fake.syncs });
+@@ -135,6 +137,7 @@
+     e.eos = 1;
+     e.round_graph = .{};
+     e.heads = .full;
++    e.kv = .bf16;
+     var seq = try e.newSeq(4);
+     // Model a queued prefill kernel writing every owned sequence buffer before request refusal.
+     for (Fake.pending[1 .. Fake.allocations + 1]) |*pending| pending.* = true;
+@@ -145,7 +148,7 @@
+ 
+ test "Flash Next completion: draft constructor fill failures and queued window writes drain before release" {
+     const Draft = @import("cuda_mtp_draft.zig").Draft;
+-    for ([_]usize{ 1, 2, 3, 4 }) |fail_fill| {
++    for ([_]usize{1}) |fail_fill| {
+         var d = Fake.init(0, fail_fill);
+         const stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(328) };
+         try t.expectError(error.NotReady, Draft.init(t.allocator, &d, stream, 4, 8, 1, .full));
