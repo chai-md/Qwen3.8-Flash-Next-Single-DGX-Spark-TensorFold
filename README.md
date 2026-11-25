@@ -39,17 +39,17 @@ is unchanged.
 ## Performance
 
 > **The sparkDash tables below are the v1.1.4 build's** (TensorFold v1.1.4 with its patches `0001` to `0017`, 2026-10-27). The recipe now builds
-> TensorFold **v1.3.4** (`12ebd414`) with patches `0001` to `0007` ([What the patches are](#what-the-patches-are)) and tuned defaults in `scripts/config.sh`; sparkDash has not been
+> TensorFold **v1.3.4** (`12ebd414`) with patches `0001` to `0008` ([What the patches are](#what-the-patches-are)) and tuned defaults in `scripts/config.sh`; sparkDash has not been
 > re-run on it. What has been measured on the same DGX Spark (2026-11-24/25, defaults: 262,144-token window, 5 streams, fp8 KV, vision on, bit-identical greedy outputs across builds) is an apples-to-apples A/B against the previous `main` recipe (`v1.2.7-93a2e93` with `TF_FLASHNEXT_CHUNK=3072` and patch `0004`):
 >
 > **`tools/bench_streams.py`** (identical prompt per stream, thinking on, median of 3):
 >
-> | | `main` (v1.2.7) | **v1.3.4 optimized (`0001..0007`)** | Change |
+> | | `main` (v1.2.7) | **v1.3.4 optimized (`0001..0008`)** | Change |
 > | --- | ---: | ---: | ---: |
-> | Decode prose, 1 / 3 / 5 streams (total tok/s) | 57.5 / 153.9 / 226.5 | **57.1 / 154.7 / 231.0** | −0.7% / +0.5% / **+2.0%** |
-> | Decode code, 1 / 3 / 5 streams (total tok/s) | 49.9 / 133.4 / 197.9 | **49.0 / 130.8 / 201.3** | −1.8% / −1.9% / **+1.7%** |
-> | Prefill 4k / 31.5k / 126k tokens (tok/s) | 2,368 / 2,429 / 2,294 | **2,577 / 2,778 / 2,582** | **+8.8% / +14.4% / +12.6%** |
-> | 199,730-token needle prefill (`tools/needle.py`) | 95.7 s (v1.2.7 README) | **82.46 s** (`found yes`) | **−13.8%** (−13.2 s) |
+> | Decode prose, 1 / 3 / 5 streams (total tok/s) | 57.5 / 153.9 / 226.5 | **57.1 / 159.1 / 235.7** | −0.7% / **+3.4%** / **+4.1%** |
+> | Decode code, 1 / 3 / 5 streams (total tok/s) | 49.9 / 133.4 / 197.9 | **49.9 / 135.3 / 203.4** | +0.0% / **+1.4%** / **+2.8%** |
+> | Prefill 4k / 31.5k / 126k tokens (tok/s) | 2,368 / 2,429 / 2,294 | **2,554 / 2,770 / 2,570** | **+7.9% / +14.0% / +12.0%** |
+> | 199,730-token needle prefill (`tools/needle.py`) | 95.7 s (v1.2.7 README) | **82.51 s** (`found yes`) | **−13.8%** (−13.2 s) |
 >
 > **Cold-prompt greedy panel** (`temperature=0`, thinking off, unique cold prompts, 5 distinct prompts for `c5`, identical SHA-256 outputs on all 6 prompts):
 >
@@ -60,7 +60,7 @@ is unchanged.
 > | Cold prefill 4k / 32k / 128k tokens (tok/s) | 2,309 / 2,455 / 2,358 | 2,311 / 2,447 / 2,349 | **2,677 / 2,666 / 2,532** | **+16.0% / +8.6% / +7.4%** |
 > | Steady-state short TTFT (ms) / cold startup (s) | 105.1 ms / 43.46 s | 97.1 ms\* / 42.6–44.1 s | **103.8 ms / 42.86 s** | −1.2% / −1.4% |
 >
-> *Wave 5C (`0006`) + Wave 5D (`0007`) stacked on top of `0001..0005` in interleaved `ctl-a / cand / ctl-b` A/B (bit-exact SHAs): cold prefill reached **2,768.2** at 4k (+2.46% +1.16%), **2,770.3** at 32k (+2.75% +1.91%), **2,570.7** at 128k (+2.55% +1.52%), `c5` gained +0.92% +1.05%, and 200k needle prefill dropped `84.87 s → 83.49 s → 82.46 s` (**−2.84%**).*
+> *Wave 5C (`0006`) + Wave 5D (`0007`) + Wave 6C-1 (`0008`) stacked on top of `0001..0005` in interleaved `ctl-a / cand / ctl-b` A/B (bit-exact SHAs): cold prefill reached **2,781.7** at 4k, **2,777.7** at 32k, **2,572.0** at 128k, 200k needle prefill dropped `84.87 s → 82.51 s`, and Wave 6C-1 (`0008`) added **+3.56% `c1` decode** (+4.79% code / +3.64% prose) and **+3.66% `c5` aggregate** (pushing `bench_streams` 5-stream prose to **235.7 tok/s** and code to **203.4 tok/s**).*
 >
 > *\*Stock v1.3.4 short TTFT is the post-boot 3-run median; `main` and v1.3.4 optimized are the post-warm steady-state 5-run medians. Note that on `bench_streams.py`, the 1-stream prose/code rows ran immediately after the greedy panel when both builds already had those repeated prompt pages warm in the OS page cache; on cold prompts, `TF_FLASHNEXT_TABLE_WARM=1` yields +8.6–9.5% single-stream decode.*
 >
@@ -532,6 +532,7 @@ Drafted replies are still checked: a drafted reply matches `"draft": false`. (Th
 | `0005` | DGX Spark / GB10 inference optimizations (bit-identical greedy outputs): (1) adds `fn_attn_prep_lanes_kv8` / `fn_attn_chunks_lanes_kv8` so `TF_FLASHNEXT_ATTN_LANES=1` collapses multi-stream shared-round attention into one launch under `--kv-cache fp8`; (2) `TF_FLASHNEXT_MTP_CACHE_ONLY=1` skips discarded attention/o_proj/writeback/MoE and one-shot `HeadKey` graph captures during MTP prompt absorption and raises absorption pieces to `min(1024, cap/8)`; (3) parallelizes startup CPU `affine4` draft-head quantization across up to 16 threads |
 | `0006` | `fn_hcn_down` single-buffered weight staging + `__launch_bounds__(224, 2)` on `fn_hcn_down2` (`flashnext_hcn.cuh` / `flashnext_hcn.cu`): drops SM 12.1 register usage from 152 → 110 regs (0 spills), doubling occupancy from 1 → 2 CTAs/SM (11 → 6 waves at 8,192 rows) with bit-identical FP32 math (+2.5–2.8% prefill, +5.3% cold `c1`, +0.9% `c5`, 200k needle 84.87 s → 83.49 s) |
 | `0007` | MXFP8 strided `shared_down` (`qmmf.cu` / `qmmf.zig` / `qmmf_shared.zig`): adds `tf_qmmf_shared{16_half,16,32,64}_mx` using the exact `qmmf_body<MXFP8, ...>` + `TF_QMMF_STRIDED` epilogue so shared-expert down projections write FP32 rows directly into `s.y` slot 10, eliminating `fn_shared_scatter` (`38.9 ms` / 12.9 GB DRAM copy per 8k chunk and 48 launches/decode step) with bit-identical outputs (+1.2–1.9% prefill, +1.05% `c5`, 200k needle 83.49 s → 82.46 s) |
+| `0008` | Load-time MXFP8 quantization of BF16 MTP proposal-layer projections (`TF_FLASHNEXT_MTP_QUANT=mxfp8` default, also supports `bf16` / `affine4`, registered in `environment.zig`): quantizes the ~178 MB of proposal-only BF16 weights (`fc_embedding`, `fc_hidden`, `mtp.layers.0.self_attn.{q,k,v,index,o}_proj`, 3× hyper-connections, `shared_expert`) to OCP MXFP8 (E4M3FN + UE8M0) at load while keeping the main verifier 100% untouched; routes MXFP8 `fc_e`/`fc_h` directly to BF16 (`sk=1`), hashes `s.part_zero` into `Key`/`SharedKey`, and preserves bit-exact outputs (+3.56% `c1` / +4.79% code / +3.66% `c5`, `bench_streams` prose 5-stream 231.0 → 235.7 tok/s, −0.58% peak RAM) |
 
 The v1.1.4 build carried seventeen patches. TensorFold v1.2.7–v1.3.4 absorbed most of them upstream (including the quantized NVIDIA FP4 vision tower and fused BF16 prompt read-out tiles via `TF_FLASHNEXT_READOUT_FUSED=1`), and the recipe enables their switches in `scripts/config.sh`.
 
@@ -589,8 +590,8 @@ covers this repository's scripts only.
   TensorFold's own Flash Next CUDA engine (code by Ash Hart and the TensorFold contributors, under TensorFold's licenses). The list, with where each
   idea comes from, is in [`CREDITS.md`](CREDITS.md): image token budget (`0001`), fp8 KV (`0002`; the format adapted from MiaAI-Lab's GLM recipe patch 0038)
   and the MXFP8 prompt tile (`0003`).
-- **Patches `0004` to `0007` (video parts & DGX Spark optimizations):** `0004` by [chai-md](https://github.com/chai-md) in
-  [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), rebased onto TensorFold v1.3.4; `0005` adds fp8 KV lane-batched attention, cache-only MTP prompt absorption, and multi-threaded `affine4` draft-head quantization; `0006` doubles `fn_hcn_down2` SM 12.1 occupancy (1 → 2 CTAs/SM via single-buffered weight staging); `0007` adds MXFP8 strided `shared_down` kernels eliminating `fn_shared_scatter`; MIT License like the rest of `patches/`.
+- **Patches `0004` to `0008` (video parts & DGX Spark optimizations):** `0004` by [chai-md](https://github.com/chai-md) in
+  [#90](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold/pull/90), rebased onto TensorFold v1.3.4; `0005` adds fp8 KV lane-batched attention, cache-only MTP prompt absorption, and multi-threaded `affine4` draft-head quantization; `0006` doubles `fn_hcn_down2` SM 12.1 occupancy (1 → 2 CTAs/SM via single-buffered weight staging); `0007` adds MXFP8 strided `shared_down` kernels eliminating `fn_shared_scatter`; `0008` adds load-time OCP MXFP8 quantization of proposal-only BF16 MTP weights (`TF_FLASHNEXT_MTP_QUANT`); MIT License like the rest of `patches/`.
   Several of the v1.1.4 build's patches (0004 to 0017) and the quantized FP4 vision tower patch are now part of TensorFold v1.3.4 in upstream's own form; upstream credits MiaAI-Lab for the K32
   expert staging it adapted from patch 0014.
 - **Earlier db281878 series** (on `main`): free after drain and admission reclaim (patch 0029) and image prompts in the prompt cache (patch 0030) by [tempeste](https://github.com/tempeste), now built

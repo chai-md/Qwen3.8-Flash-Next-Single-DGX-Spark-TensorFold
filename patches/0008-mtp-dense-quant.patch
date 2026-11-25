@@ -1,0 +1,698 @@
+diff --git a/zig/src/platform/environment.zig b/zig/src/platform/environment.zig
+--- a/zig/src/platform/environment.zig
++++ b/zig/src/platform/environment.zig
+@@ -293,6 +293,7 @@
+     .{ .name = "HUGGING_FACE_HUB_TOKEN", .scope = .hub, .kind = .path, .trim = " \t\n\r\x0b\x0c", .forms = "a Hugging Face token without control characters (pull only)" },
+     .{ .name = "HF_TOKEN_PATH", .scope = .hub, .kind = .path, .forms = "a path without control characters to the Hugging Face token file (pull only)" },
+     .{ .name = "TF_FLASHNEXT_DRAFT_HEAD", .scope = .flashnext, .kind = .word, .words = &.{ "bf16", "affine4" }, .forms = "bf16 or affine4 (unset or blank keeps affine4, a bf16 language head's draft rows as 4-bit groups of 32; bf16 keeps the rows as stored)" },
++    .{ .name = "TF_FLASHNEXT_MTP_QUANT", .scope = .flashnext, .kind = .word, .words = &.{ "bf16", "mxfp8", "affine4" }, .forms = "bf16, mxfp8 or affine4 (unset or blank keeps mxfp8, quantizing bf16 MTP proposal projections at load; bf16 keeps them as stored)" },
+     // Family rank and prompt settings below are read through their own family's startup scope.
+     .{ .name = "TF_GLM_INDEX_CUDA", .scope = .glm, .kind = .word, .words = &.{ "1", "0", "scores" }, .forms = "1 (both kernels), 0 (neither) or scores (scores only; unset or blank is both)" },
+     .{ .name = "TF_GLM_KV_HOST_GIB", .scope = .glm, .kind = .real, .forms = "a finite GiB amount of at least 0 (unset or blank uses one full window and 16 rows a page)" },
+diff --git a/zig/src/platform/environment_flashnext_test.zig b/zig/src/platform/environment_flashnext_test.zig
+--- a/zig/src/platform/environment_flashnext_test.zig
++++ b/zig/src/platform/environment_flashnext_test.zig
+@@ -33,13 +33,13 @@
+     try t.expect(std.mem.endsWith(u8, why.?, e.rule(name).forms));
+ }
+ 
+-test "Flash Next strict env: the table holds all 37 settings: 25 switches, 9 integers, 1 real, 2 structured" {
++test "Flash Next strict env: the table holds all 39 settings: 26 switches, 9 integers, 1 real, 3 structured" {
+     var counts: [4]usize = @splat(0);
+     for (e.rules) |r| if (r.scope == .flashnext) {
+         try t.expect(std.mem.startsWith(u8, r.name, "TF_FLASHNEXT_"));
+         counts[@backingInt(group(r))] += 1;
+     };
+-    try t.expectEqual([4]usize{ 25, 9, 1, 2 }, counts);
++    try t.expectEqual([4]usize{ 26, 9, 1, 3 }, counts);
+ }
+ 
+ test "Flash Next strict env: unset and blank settings both read as the caller's default" {
+@@ -140,6 +140,17 @@
+     for ([_][]const u8{ "BF16", "affine", "fp8", "1", "affine4 " }) |raw| try check(name, raw, false);
+ }
+ 
++test "Flash Next strict env: MTP quant keeps bf16, mxfp8 and affine4 in the reader's order and refuses other text" {
++    const name = "TF_FLASHNEXT_MTP_QUANT";
++    try check(name, "bf16", true);
++    try check(name, "mxfp8", true);
++    try check(name, "affine4", true);
++    try t.expectEqual(@as(u2, 0), try e.value(u2, name, "bf16", 2));
++    try t.expectEqual(@as(u2, 1), try e.value(u2, name, "mxfp8", 2));
++    try t.expectEqual(@as(u2, 2), try e.value(u2, name, "affine4", 0));
++    for ([_][]const u8{ "BF16", "fp8", "int4", "1", "mxfp8 " }) |raw| try check(name, raw, false);
++}
++
+ test "Flash Next strict env: the late keep reads unset and blank as null, and 0 and 1 as false and true" {
+     const name = "TF_FLASHNEXT_KEEP_LATE";
+     for ([_]?[]const u8{ null, "", " ", "\t", " \t\r\n" }) |raw|
+diff --git a/zig/src/families/flashnext/cuda_mtp_quant.zig b/zig/src/families/flashnext/cuda_mtp_quant.zig
+new file mode 100644
+--- /dev/null
++++ b/zig/src/families/flashnext/cuda_mtp_quant.zig
+@@ -0,0 +1,355 @@
++//! Load-time quantization of BF16 MTP proposal-layer projections (TF_FLASHNEXT_MTP_QUANT).
++//! Proposal-only: the main verifier model and its weights remain completely untouched.
++const std = @import("std");
++const cuda = @import("cuda");
++const wt = @import("cuda_prompt_wt.zig");
++const projection = @import("cuda_projection.zig");
++const projections = @import("cuda_projection_load.zig");
++const affine = @import("cuda_draft_affine.zig");
++const environment = @import("sys").environment;
++
++const setting_name = "TF_FLASHNEXT_MTP_QUANT";
++
++/// How BF16 MTP proposal projections are held; the order matches environment.zig's accepted words.
++pub const Mode = enum(u2) { bf16 = 0, mxfp8 = 1, affine4 = 2 };
++
++/// Default for unset/blank TF_FLASHNEXT_MTP_QUANT.
++pub const default_mode: Mode = .mxfp8;
++
++pub fn parse(raw: ?[]const u8) !Mode {
++    return @enumFromInt(try environment.value(u2, setting_name, raw, @intFromEnum(default_mode)));
++}
++
++pub fn mode() !Mode {
++    return @enumFromInt(try environment.read(u2, setting_name, @intFromEnum(default_mode)));
++}
++
++fn readBf16(bytes: []const u8, i: usize) f32 {
++    return @bitCast(@as(u32, std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little)) << 16);
++}
++
++/// Round-to-nearest-even finite f32 to IEEE/OCP FP8 E4M3FN (max finite 448.0, 0x7e).
++pub fn f32ToE4m3fn(v: f32) u8 {
++    const bits: u32 = @bitCast(v);
++    const sign: u8 = @intCast((bits >> 31) << 7);
++    const abs_v = @abs(v);
++    if (abs_v == 0) return 0;
++    if (abs_v >= 448.0) return sign | 0x7e;
++    // Subnormal E4M3FN range: < 2^-6 (0.015625), step = 2^-9.
++    if (abs_v < 0.015625) {
++        const scaled = abs_v * 512.0;
++        const lo = @floor(scaled);
++        const integer: u8 = @intFromFloat(lo);
++        const frac = scaled - lo;
++        const rounded = integer + @intFromBool(frac > 0.5 or (frac == 0.5 and (integer & 1) == 1));
++        if (rounded == 0) return 0;
++        if (rounded >= 8) return sign | 0x08; // smallest normal 2^-6
++        return sign | rounded;
++    }
++    const abits: u32 = bits & 0x7fff_ffff;
++    const e32: i32 = @as(i32, @intCast(abits >> 23)) - 127;
++    const m32: u32 = abits & 0x007f_ffff;
++    const rem: u32 = m32 & 0x000f_ffff;
++    var m3: u32 = (m32 >> 20) + @intFromBool(rem > 0x0008_0000 or (rem == 0x0008_0000 and ((m32 >> 20) & 1) == 1));
++    var e4: i32 = e32 + 7;
++    if (m3 == 8) {
++        m3 = 0;
++        e4 += 1;
++    }
++    if (e4 > 15 or (e4 == 15 and m3 > 6)) return sign | 0x7e;
++    return sign | (@as(u8, @intCast(e4)) << 3) | @as(u8, @intCast(m3));
++}
++
++/// Quantize one BF16 row of `k` elements (multiple of 32) into OCP MXFP8 (E4M3FN codes + UE8M0 group-32 scales).
++pub fn mxfp8Row(input: []const u8, codes: []u8, scales: []u8) !void {
++    const k = input.len / 2;
++    if (k == 0 or k % 32 != 0 or input.len != k * 2 or codes.len != k or scales.len != k / 32)
++        return error.UnexpectedTensor;
++    for (0..k / 32) |g| {
++        const at = g * 32;
++        var amax: f32 = 0;
++        for (0..32) |i| {
++            const v = readBf16(input, at + i);
++            if (!std.math.isFinite(v)) return error.UnexpectedTensor;
++            amax = @max(amax, @abs(v));
++        }
++        if (amax == 0) {
++            scales[g] = 127;
++            @memset(codes[at..][0..32], 0);
++            continue;
++        }
++        // Choose smallest power-of-two scale 2^e >= amax / 448.0 so max |v| / 2^e <= 448.0.
++        const raw_e: i32 = @intFromFloat(@ceil(@log2(@as(f64, amax) / 448.0)));
++        const exp: i32 = std.math.clamp(raw_e, -127, 127);
++        scales[g] = @intCast(exp + 127);
++        const inv_scale: f32 = @floatCast(@exp2(@as(f64, @floatFromInt(-exp))));
++        for (0..32) |i| {
++            codes[at + i] = f32ToE4m3fn(readBf16(input, at + i) * inv_scale);
++        }
++    }
++}
++
++fn quantizeMxfp8(a: std.mem.Allocator, d: *const cuda.Driver, bytes: []const u8, n: usize, k: usize) !wt.Q4 {
++    const count = try std.math.mul(usize, n, k);
++    if (bytes.len != try std.math.mul(usize, count, 2) or k % 64 != 0) return error.UnexpectedTensor;
++    const codes = try a.alloc(u8, count);
++    defer a.free(codes);
++    const scales = try a.alloc(u8, count / 32);
++    defer a.free(scales);
++    const Work = struct {
++        bytes: []const u8,
++        codes: []u8,
++        scales: []u8,
++        k: usize,
++        lo: usize,
++        hi: usize,
++        failed: ?anyerror = null,
++        fn run(w: *@This()) void {
++            for (w.lo..w.hi) |i| {
++                mxfp8Row(
++                    w.bytes[i * w.k * 2 ..][0 .. w.k * 2],
++                    w.codes[i * w.k ..][0..w.k],
++                    w.scales[i * (w.k / 32) ..][0 .. w.k / 32],
++                ) catch |err| {
++                    w.failed = err;
++                    return;
++                };
++            }
++        }
++    };
++    const max_t: usize = 16;
++    const cpus = std.Thread.getCpuCount() catch 8;
++    const t_n = @max(1, @min(max_t, cpus, n));
++    const per = (n + t_n - 1) / t_n;
++    var works: [max_t]Work = undefined;
++    var handles: [max_t]?std.Thread = @splat(null);
++    for (0..t_n) |t| {
++        const lo = @min(n, t * per);
++        const hi = @min(n, (t + 1) * per);
++        works[t] = .{ .bytes = bytes, .codes = codes, .scales = scales, .k = k, .lo = lo, .hi = hi };
++        handles[t] = if (t + 1 < t_n) (std.Thread.spawn(.{}, Work.run, .{&works[t]}) catch blk: {
++            works[t].run();
++            break :blk null;
++        }) else blk: {
++            works[t].run();
++            break :blk null;
++        };
++    }
++    for (handles[0..t_n]) |h| if (h) |th| th.join();
++    for (works[0..t_n]) |w| if (w.failed) |err| return err;
++    return projection.mxfp8(
++        a,
++        d,
++        .{ .dtype = .f8_e4m3, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = codes },
++        .{ .dtype = .u8, .rank = 2, .shape = .{ n, k / 32, 1, 1, 1 }, .bytes = scales },
++    );
++}
++
++const AffinePlanes = struct {
++    words: []u8,
++    scales: []u8,
++    biases: []u8,
++
++    fn free(self: *AffinePlanes, a: std.mem.Allocator) void {
++        a.free(self.words);
++        a.free(self.scales);
++        a.free(self.biases);
++    }
++};
++
++fn quantizeAffinePlanes(a: std.mem.Allocator, bytes: []const u8, n: usize, k: usize) !AffinePlanes {
++    const count = try std.math.mul(usize, n, k);
++    if (bytes.len != try std.math.mul(usize, count, 2) or k % 32 != 0) return error.UnexpectedTensor;
++    const words = try a.alloc(u8, count / 2);
++    errdefer a.free(words);
++    const scales = try a.alloc(u8, count / 16);
++    errdefer a.free(scales);
++    const biases = try a.alloc(u8, count / 16);
++    errdefer a.free(biases);
++    const Work = struct {
++        bytes: []const u8,
++        words: []u8,
++        scales: []u8,
++        biases: []u8,
++        k: usize,
++        lo: usize,
++        hi: usize,
++        failed: ?anyerror = null,
++        fn run(w: *@This()) void {
++            for (w.lo..w.hi) |i| {
++                affine.row(
++                    w.bytes[i * w.k * 2 ..][0 .. w.k * 2],
++                    w.words[i * (w.k / 2) ..][0 .. w.k / 2],
++                    w.scales[i * (w.k / 16) ..][0 .. w.k / 16],
++                    w.biases[i * (w.k / 16) ..][0 .. w.k / 16],
++                ) catch |err| {
++                    w.failed = err;
++                    return;
++                };
++            }
++        }
++    };
++    const max_t: usize = 16;
++    const cpus = std.Thread.getCpuCount() catch 8;
++    const t_n = @max(1, @min(max_t, cpus, n));
++    const per = (n + t_n - 1) / t_n;
++    var works: [max_t]Work = undefined;
++    var handles: [max_t]?std.Thread = @splat(null);
++    for (0..t_n) |t| {
++        const lo = @min(n, t * per);
++        const hi = @min(n, (t + 1) * per);
++        works[t] = .{ .bytes = bytes, .words = words, .scales = scales, .biases = biases, .k = k, .lo = lo, .hi = hi };
++        handles[t] = if (t + 1 < t_n) (std.Thread.spawn(.{}, Work.run, .{&works[t]}) catch blk: {
++            works[t].run();
++            break :blk null;
++        }) else blk: {
++            works[t].run();
++            break :blk null;
++        };
++    }
++    for (handles[0..t_n]) |h| if (h) |th| th.join();
++    for (works[0..t_n]) |w| if (w.failed) |err| return err;
++    return .{ .words = words, .scales = scales, .biases = biases };
++}
++
++pub fn quantizeProjection(a: std.mem.Allocator, d: *cuda.Driver, bytes: []const u8, n: usize, k: usize, role: Mode) !wt.Q4 {
++    return switch (role) {
++        .bf16 => projection.dense(a, d, .{ .dtype = .bf16, .rank = 2, .shape = .{ n, k, 1, 1, 1 }, .bytes = bytes }),
++        .mxfp8 => quantizeMxfp8(a, d, bytes, n, k),
++        .affine4 => blk: {
++            var planes = try quantizeAffinePlanes(a, bytes, n, k);
++            defer planes.free(a);
++            break :blk wt.uploadQ4(a, d, planes.words, planes.scales, planes.biases, n, k / 8);
++        },
++    };
++}
++
++pub fn loadProjection(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, prefix: []const u8, n: usize, k: usize, role: Mode) !wt.Q4 {
++    if (role == .bf16) return projections.load(a, d, store, prefix, n, k);
++    var buf: [512]u8 = undefined;
++    const t = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.weight", .{prefix}));
++    if (t.dtype != .bf16) return projections.load(a, d, store, prefix, n, k);
++    if (!t.is(.bf16, &.{ n, k })) return error.UnexpectedTensor;
++    const bytes = try a.dupe(u8, t.bytes);
++    defer a.free(bytes);
++    return quantizeProjection(a, d, bytes, n, k, role);
++}
++
++pub fn loadStitchedProjection(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, prefix: []const u8, names: []const []const u8, n: usize, k: usize, role: Mode) !wt.Q4 {
++    if (role == .bf16 or names.len == 0) return projections.loadStitched(a, d, store, prefix, names, n, k);
++    var buf: [512]u8 = undefined;
++    const first = try store.tensor(try std.fmt.bufPrint(&buf, "{s}{s}.weight", .{ prefix, names[0] }));
++    if (first.dtype != .bf16) return projections.loadStitched(a, d, store, prefix, names, n, k);
++    const bytes = try a.alloc(u8, try std.math.mul(usize, try std.math.mul(usize, n, k), 2));
++    defer a.free(bytes);
++    var at: usize = 0;
++    for (names) |part_name| {
++        const t = try store.tensor(try std.fmt.bufPrint(&buf, "{s}{s}.weight", .{ prefix, part_name }));
++        if (t.dtype != .bf16 or t.rank != 2 or t.dim(1) != k or t.bytes.len != t.dim(0) * k * 2 or t.bytes.len > bytes.len - at)
++            return error.UnexpectedTensor;
++        @memcpy(bytes[at..][0..t.bytes.len], t.bytes);
++        at += t.bytes.len;
++    }
++    if (at != bytes.len) return error.UnexpectedTensor;
++    return quantizeProjection(a, d, bytes, n, k, role);
++}
++
++/// Load an MTP hyper-connection block, quantizing BF16 down/up matrices according to `role`.
++pub fn loadHc(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, prefix: []const u8, inject: bool, role: Mode) !wt.HcW {
++    if (role == .bf16) return wt.loadHc(a, d, store, prefix, inject);
++    var buf: [200]u8 = undefined;
++    const down_t = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.input_mix_weight_down.weight", .{prefix}));
++    if (down_t.dtype != .bf16) return wt.loadHc(a, d, store, prefix, inject);
++    const n = wt.low + if (inject) wt.streams else @as(usize, 0);
++    const down_bytes = try a.alloc(u8, n * wt.wide * 2);
++    defer a.free(down_bytes);
++    if (!down_t.is(.bf16, &.{ wt.low, wt.wide }) or down_t.bytes.len != wt.low * wt.wide * 2) return error.UnexpectedTensor;
++    @memcpy(down_bytes[0..down_t.bytes.len], down_t.bytes);
++    if (inject) {
++        const inj = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.block_inject_weight.weight", .{prefix}));
++        if (!inj.is(.bf16, &.{ wt.streams, wt.wide }) or inj.bytes.len != wt.streams * wt.wide * 2) return error.UnexpectedTensor;
++        @memcpy(down_bytes[wt.low * wt.wide * 2 ..], inj.bytes);
++    }
++    const up_t = try store.tensor(try std.fmt.bufPrint(&buf, "{s}.input_mix_weight_up.weight", .{prefix}));
++    if (!up_t.is(.bf16, &.{ wt.wide, wt.low }) or up_t.bytes.len != wt.wide * wt.low * 2) return error.UnexpectedTensor;
++    const up_bytes = try a.dupe(u8, up_t.bytes);
++    defer a.free(up_bytes);
++    const gamma = try store.normScale(a, try store.tensor(try std.fmt.bufPrint(&buf, "{s}.hc_norm.weight", .{prefix})));
++    defer a.free(gamma);
++    if (gamma.len != wt.wide) return error.UnexpectedTensor;
++
++    var dq = switch (role) {
++        .bf16 => unreachable,
++        .mxfp8 => try quantizeMxfp8(a, d, down_bytes, n, wt.wide),
++        .affine4 => blk: {
++            var dp = try quantizeAffinePlanes(a, down_bytes, n, wt.wide);
++            defer dp.free(a);
++            break :blk try wt.uploadTiled(a, d, dp.words, dp.scales, dp.biases, n, wt.wide / 8);
++        },
++    };
++    errdefer dq.free();
++    var uq = switch (role) {
++        .bf16 => unreachable,
++        .mxfp8 => try quantizeMxfp8(a, d, up_bytes, wt.wide, wt.low),
++        .affine4 => blk: {
++            var up_p = try quantizeAffinePlanes(a, up_bytes, wt.wide, wt.low);
++            defer up_p.free(a);
++            break :blk try wt.uploadTiled(a, d, up_p.words, up_p.scales, up_p.biases, wt.wide, wt.low / 8);
++        },
++    };
++    errdefer uq.free();
++    const scale = try cuda.DeviceBuffer.fromHost(d, std.mem.sliceAsBytes(gamma));
++    return .{ .scale = scale, .down = dq, .up = uq, .n_down = n, .has_inj = @intFromBool(inject) };
++}
++
++fn decodeE4m3fn(code: u8) f64 {
++    const sign: f64 = if ((code & 0x80) != 0) -1.0 else 1.0;
++    const exp: i32 = @intCast((code >> 3) & 0x0f);
++    const mant: u8 = code & 0x07;
++    if (exp == 0) return sign * @as(f64, @floatFromInt(mant)) * std.math.pow(f64, 2.0, -9.0);
++    return sign * (1.0 + @as(f64, @floatFromInt(mant)) / 8.0) * std.math.pow(f64, 2.0, @as(f64, @floatFromInt(exp - 7)));
++}
++
++test "TF_FLASHNEXT_MTP_QUANT parses bf16, mxfp8, affine4 and defaults blank/unset" {
++    for ([_]?[]const u8{ null, "", " ", "\t", " \t\r\n" }) |raw| try std.testing.expectEqual(default_mode, try parse(raw));
++    try std.testing.expectEqual(Mode.bf16, try parse("bf16"));
++    try std.testing.expectEqual(Mode.mxfp8, try parse("mxfp8"));
++    try std.testing.expectEqual(Mode.affine4, try parse("affine4"));
++    for ([_][]const u8{ "BF16", "fp8", "int4", "1", "mxfp8 " }) |raw| try std.testing.expectError(error.InvalidEnvironment, parse(raw));
++}
++
++test "E4M3FN encoding handles exact powers, subnormals, saturation, and zero" {
++    try std.testing.expectEqual(@as(u8, 0x00), f32ToE4m3fn(0.0));
++    try std.testing.expectEqual(@as(u8, 0x38), f32ToE4m3fn(1.0));
++    try std.testing.expectEqual(@as(u8, 0xb8), f32ToE4m3fn(-1.0));
++    try std.testing.expectEqual(@as(u8, 0x7e), f32ToE4m3fn(448.0));
++    try std.testing.expectEqual(@as(u8, 0x7e), f32ToE4m3fn(1000.0));
++    try std.testing.expectEqual(@as(u8, 0xfe), f32ToE4m3fn(-1000.0));
++    try std.testing.expectEqual(@as(u8, 0x08), f32ToE4m3fn(0.015625));
++    try std.testing.expectEqual(@as(u8, 0x01), f32ToE4m3fn(1.0 / 512.0));
++}
++
++test "mxfp8Row matches independent FP64 dequantization within E4M3FN rounding tolerance" {
++    var input: [128]u8 = undefined;
++    for (0..64) |i| {
++        const v: f32 = if (i < 32) @sin(@as(f32, @floatFromInt(i)) * 0.41) * 0.08 else 0.0;
++        std.mem.writeInt(u16, input[i * 2 ..][0..2], affine.bf16(v), .little);
++    }
++    var codes: [64]u8 = undefined;
++    var scales: [2]u8 = undefined;
++    try mxfp8Row(&input, &codes, &scales);
++    // Second group is all zeros: unit scale (127) and zero codes.
++    try std.testing.expectEqual(@as(u8, 127), scales[1]);
++    for (codes[32..]) |c| try std.testing.expectEqual(@as(u8, 0), c);
++    // First group: dequantize with UE8M0 scale and verify bounded error.
++    const sc = std.math.pow(f64, 2.0, @as(f64, @floatFromInt(@as(i32, scales[0]) - 127)));
++    for (0..32) |i| {
++        const orig: f64 = readBf16(&input, i);
++        const back = decodeE4m3fn(codes[i]) * sc;
++        const tol = @max(@abs(orig) * 0.065, sc * (1.0 / 512.0));
++        try std.testing.expect(@abs(back - orig) <= tol);
++    }
++    // Non-finite input is rejected.
++    std.mem.writeInt(u16, input[0..2], 0x7f80, .little);
++    try std.testing.expectError(error.UnexpectedTensor, mxfp8Row(&input, &codes, &scales));
++}
+diff --git a/zig/src/families/flashnext/cuda_mtp.zig b/zig/src/families/flashnext/cuda_mtp.zig
+--- a/zig/src/families/flashnext/cuda_mtp.zig
++++ b/zig/src/families/flashnext/cuda_mtp.zig
+@@ -224,7 +224,6 @@
+         var store = try wt.Store.open(gpa, io, dir);
+         defer store.deinit();
+         try store.detectNorms();
+-        var buf: [120]u8 = undefined;
+         const ne = try store.normScale(gpa, try store.tensor("language_model.mtp.pre_fc_norm_embedding.weight"));
+         defer gpa.free(ne);
+         const nh = try store.normScale(gpa, try store.tensor("language_model.mtp.pre_fc_norm_hidden.weight"));
+@@ -234,17 +233,19 @@
+         errdefer h.norm_e.free();
+         h.norm_h = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(nh));
+         errdefer h.norm_h.free();
+-        h.fc_e = try fc(gpa, driver, &store, &buf, "language_model.mtp.fc_embedding");
++        const mtp_quant = @import("cuda_mtp_quant.zig");
++        const qmode = try mtp_quant.mode();
++        h.fc_e = try mtp_quant.loadProjection(gpa, driver, &store, "language_model.mtp.fc_embedding", dims, dims, qmode);
+         errdefer h.fc_e.free();
+-        h.fc_h = try fc(gpa, driver, &store, &buf, "language_model.mtp.fc_hidden");
++        h.fc_h = try mtp_quant.loadProjection(gpa, driver, &store, "language_model.mtp.fc_hidden", dims, dims, qmode);
+         errdefer h.fc_h.free();
+-        h.mixer = try wt.loadHc(gpa, driver, &store, "language_model.mtp.hyper_connection_mixer", false);
++        h.mixer = try mtp_quant.loadHc(gpa, driver, &store, "language_model.mtp.hyper_connection_mixer", false, qmode);
+         errdefer h.mixer.free();
+         {
+             var pack_mod = try cuda.Module.load(driver, cuda.kernels.experts_pack);
+             defer pack_mod.unload();
+             const pack_fn = try pack_mod.function(wt.pack_symbol);
+-            h.layer = try load.loadLayerAt(gpa, driver, stream, &store, pack_fn, "language_model.mtp.layers.0", false, false);
++            h.layer = try load.loadLayerAtQuant(gpa, driver, stream, &store, pack_fn, "language_model.mtp.layers.0", false, false, qmode);
+         }
+         store.dropStaging(); // the head's experts are on the device
+         errdefer h.layer.free(gpa);
+@@ -267,11 +268,6 @@
+         return h;
+     }
+ 
+-    fn fc(gpa: std.mem.Allocator, driver: *cuda.Driver, store: *wt.Store, buf: []u8, name: []const u8) !Q4 {
+-        _ = buf;
+-        return @import("cuda_projection_load.zig").load(gpa, driver, store, name, dims, dims);
+-    }
+-
+     pub fn deinit(h: *Head) void {
+         h.draw_batch.deinit(h.gpa);
+         h.module.unload();
+@@ -434,4 +430,5 @@
+ test {
+     _ = @import("cuda_mtp_nonfinite_test.zig");
+     _ = @import("cuda_mtp_load.zig");
+-}
++    _ = @import("cuda_mtp_quant.zig");
++}
+diff --git a/zig/src/families/flashnext/cuda_mtp_ops.zig b/zig/src/families/flashnext/cuda_mtp_ops.zig
+--- a/zig/src/families/flashnext/cuda_mtp_ops.zig
++++ b/zig/src/families/flashnext/cuda_mtp_ops.zig
+@@ -135,7 +135,8 @@
+             const cache_only_on = if (std.c.getenv("TF_FLASHNEXT_MTP_CACHE_ONLY")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+             // In cache-only prompt absorption, larger pieces (<= s.cap / 8, capped at 1024) stay well inside s.part (2*cap) and amortize BF16 GEMMs.
+             const max_piece: usize = if (cache_only_on and !scores) @max(piece_rows, @min(@as(usize, 1024), s.cap / 8)) else piece_rows;
+-            const piece = @max(@as(usize, 1), @min(max_piece, s.cap / 2));
++            const part_cap = @import("cuda_scratch_sizes.zig").partRows(s.cap) / (2 * streams);
++            const piece = @max(@as(usize, 1), @min(@min(max_piece, s.cap / 2), part_cap));
+             // the engine's block scores (the passes share one stream), for rows past 2,048 keys of the head's cache
+             const score_rows = try e.reserveScores(d.cap, @min(piece, piece_rows));
+             var p: batch.Pass(Tri) = .{
+diff --git a/zig/src/families/flashnext/cuda_mtp_pieces.zig b/zig/src/families/flashnext/cuda_mtp_pieces.zig
+--- a/zig/src/families/flashnext/cuda_mtp_pieces.zig
++++ b/zig/src/families/flashnext/cuda_mtp_pieces.zig
+@@ -38,12 +38,20 @@
+             }
+             try @import("cuda_media.zig").injectNext(r.d.media, ee.stream.*, ps.ple_keys, r.d.len, m);
+             try t.rmsnorm(ps.ple_keys, hh.norm_e.ptr, ps.mixed, ps.xsm, eps, wide, m, dims, dims);
+-            const esk = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.dummy, ps.part, m, fc_sk);
+-            try pp.sumSlices(ps.part, ps.branch, true, m * dims, esk);
++            if (hh.fc_e.native != null and hh.fc_e.native.?.mode == .mxfp8) {
++                _ = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.branch, ps.dummy, m, 1);
++            } else {
++                const esk = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.dummy, ps.part, m, fc_sk);
++                try pp.sumSlices(ps.part, ps.branch, true, m * dims, esk);
++            }
+             // the hidden branch: the four streams normed as one row, fc_hidden on each stream
+             try t.rmsnorm(r.input, hh.norm_h.ptr, ps.norm, ps.gq, eps, wide, m, wide, wide);
+-            const hsk = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.dummy, ps.part, streams * m, fc_sk);
+-            try pp.sumSlices(ps.part, ps.ple_gated, true, streams * m * dims, hsk);
++            if (hh.fc_h.native != null and hh.fc_h.native.?.mode == .mxfp8) {
++                _ = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.ple_gated, ps.dummy, streams * m, 1);
++            } else {
++                const hsk = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.dummy, ps.part, streams * m, fc_sk);
++                try pp.sumSlices(ps.part, ps.ple_gated, true, streams * m * dims, hsk);
++            }
+             try t.addStreams(ps.branch, ps.ple_gated, ps.h, m, dims, streams);
+             // the layer: attention over the head's own cache, its experts
+             try pp.writeback(0, m);
+@@ -110,8 +118,12 @@
+                 try t.embed(ps.ids, ee.table.w.ptr, ee.table.s.ptr, ee.table.b.ptr, ps.ple_keys, dims, streams, tot);
+             }
+             try t.rmsnorm(ps.ple_keys, hh.norm_e.ptr, ps.mixed, ps.xsm, eps, wide, tot, dims, dims);
+-            const esk = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.dummy, ps.part, tot, fc_sk);
+-            try pp.sumSlices(ps.part, ps.branch, true, tot * dims, esk);
++            if (hh.fc_e.native != null and hh.fc_e.native.?.mode == .mxfp8) {
++                _ = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.branch, ps.dummy, tot, 1);
++            } else {
++                const esk = try pp.lane(ps.mixed, ps.xsm, hh.fc_e, ps.dummy, ps.part, tot, fc_sk);
++                try pp.sumSlices(ps.part, ps.branch, true, tot * dims, esk);
++            }
+             // each lane's rows of main-model streams, side by side (the head reads them as one block of rows)
+             var row0: usize = 0;
+             for (r.group.rows, r.group.nexts) |rw, nx| {
+@@ -119,8 +131,12 @@
+                 row0 += nx.len;
+             }
+             try t.rmsnorm(ps.ple_nrow, hh.norm_h.ptr, ps.norm, ps.gq, eps, wide, tot, wide, wide);
+-            const hsk = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.dummy, ps.part, streams * tot, fc_sk);
+-            try pp.sumSlices(ps.part, ps.ple_gated, true, streams * tot * dims, hsk);
++            if (hh.fc_h.native != null and hh.fc_h.native.?.mode == .mxfp8) {
++                _ = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.ple_gated, ps.dummy, streams * tot, 1);
++            } else {
++                const hsk = try pp.lane(ps.norm, ps.gq, hh.fc_h, ps.dummy, ps.part, streams * tot, fc_sk);
++                try pp.sumSlices(ps.part, ps.ple_gated, true, streams * tot * dims, hsk);
++            }
+             try t.addStreams(ps.branch, ps.ple_gated, ps.h, tot, dims, streams);
+             try pp.writeback(0, tot);
+             try pp.readout(hh.layer.attn_hc, 0, tot);
+diff --git a/zig/src/families/flashnext/cuda_prompt_load.zig b/zig/src/families/flashnext/cuda_prompt_load.zig
+--- a/zig/src/families/flashnext/cuda_prompt_load.zig
++++ b/zig/src/families/flashnext/cuda_prompt_load.zig
+@@ -7,6 +7,7 @@
+ const wt = @import("cuda_prompt_wt.zig");
+ const mixed = @import("cuda_mixed_experts.zig");
+ const projections = @import("cuda_projection_load.zig");
++const mtp_quant = @import("cuda_mtp_quant.zig");
+ const dense_split = @import("cuda_dense_split.zig");
+ const Cut = @import("cuda_modelopt_experts.zig").Cut;
+ const Heads = @import("cuda_heads.zig").Heads;
+@@ -267,15 +268,20 @@
+ pub fn loadLayerRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, layer: usize, world: usize, rank: usize, pocket: ?*Pocket) !Layer {
+     var buf: [80]u8 = undefined;
+     const base = try std.fmt.bufPrint(&buf, "language_model.model.layers.{d}", .{layer});
+-    return loadLayerAtRank(gpa, driver, stream, store, pack_fn, base, linearLayer(layer), layer == ple_layer, world, rank, pocket);
++    return loadLayerAtRank(gpa, driver, stream, store, pack_fn, base, linearLayer(layer), layer == ple_layer, world, rank, pocket, .bf16);
+ }
+ 
+ /// The decoder layer under `base` (the MTP head's "language_model.mtp.layers.0": full attention, no n-gram branch).
+ pub fn loadLayerAt(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, base: []const u8, linear: bool, with_ple: bool) !Layer {
+-    return loadLayerAtRank(gpa, driver, stream, store, pack_fn, base, linear, with_ple, 1, 0, null);
+-}
+-
+-fn loadLayerAtRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, base: []const u8, linear: bool, with_ple: bool, world: usize, rank: usize, pocket: ?*Pocket) !Layer {
++    return loadLayerAtRank(gpa, driver, stream, store, pack_fn, base, linear, with_ple, 1, 0, null, .bf16);
++}
++
++/// loadLayerAt with optional load-time quantization of BF16 MTP proposal projections.
++pub fn loadLayerAtQuant(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, base: []const u8, linear: bool, with_ple: bool, quant: mtp_quant.Mode) !Layer {
++    return loadLayerAtRank(gpa, driver, stream, store, pack_fn, base, linear, with_ple, 1, 0, null, quant);
++}
++
++fn loadLayerAtRank(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: *cuda.Stream, store: *Store, pack_fn: cuda.Function, base: []const u8, linear: bool, with_ple: bool, world: usize, rank: usize, pocket: ?*Pocket, quant: mtp_quant.Mode) !Layer {
+     // decided before any view is held: deciding maps layer 0's shard; the split halves the heads and cuts the outs
+     const heads = try dense_split.heads(store, world);
+     const cut: ?Cut = if (!heads.eql(.full)) try Cut.init(dims, world, rank) else null;
+@@ -285,9 +291,9 @@
+     var base_buf: [80]u8 = undefined;
+     @memcpy(base_buf[0..base.len], base);
+     const root = base_buf[0..base.len];
+-    var attn_hc = try loadHc(gpa, driver, store, try std.fmt.bufPrint(&buf, "{s}.attn_hyper_connection", .{root}), true);
++    var attn_hc = if (quant == .bf16) try loadHc(gpa, driver, store, try std.fmt.bufPrint(&buf, "{s}.attn_hyper_connection", .{root}), true) else try mtp_quant.loadHc(gpa, driver, store, try std.fmt.bufPrint(&buf, "{s}.attn_hyper_connection", .{root}), true, quant);
+     errdefer attn_hc.free();
+-    var mlp_hc = try loadHc(gpa, driver, store, try std.fmt.bufPrint(&buf, "{s}.mlp_hyper_connection", .{root}), true);
++    var mlp_hc = if (quant == .bf16) try loadHc(gpa, driver, store, try std.fmt.bufPrint(&buf, "{s}.mlp_hyper_connection", .{root}), true) else try mtp_quant.loadHc(gpa, driver, store, try std.fmt.bufPrint(&buf, "{s}.mlp_hyper_connection", .{root}), true, quant);
+     errdefer mlp_hc.free();
+     const mlp = try std.fmt.bufPrint(&buf, "{s}.mlp", .{root});
+     var mlp_buf: [96]u8 = undefined;
+@@ -383,9 +389,9 @@
+         if (cut != null) {
+             const st = try heads_cut.attention(heads, at);
+             proj_q = try projections.loadStitchedCut(gpa, driver, store, ap, &heads_cut.attention_parts, &st.ranges, st.n, dims, st.sk);
+-        } else proj_q = try projections.loadStitched(gpa, driver, store, ap, &heads_cut.attention_parts, proj_n, dims);
++        } else proj_q = if (quant == .bf16) try projections.loadStitched(gpa, driver, store, ap, &heads_cut.attention_parts, proj_n, dims) else try mtp_quant.loadStitchedProjection(gpa, driver, store, ap, &heads_cut.attention_parts, proj_n, dims, quant);
+         const out_name = try std.fmt.bufPrint(&buf, "{s}.o_proj", .{ap});
+-        out_q = if (cut) |c| try projections.loadCut(gpa, driver, store, out_name, dims, out_k, c, .rows) else try projections.load(gpa, driver, store, out_name, dims, out_k);
++        out_q = if (cut) |c| try projections.loadCut(gpa, driver, store, out_name, dims, out_k, c, .rows) else if (quant == .bf16) try projections.load(gpa, driver, store, out_name, dims, out_k) else try mtp_quant.loadProjection(gpa, driver, store, out_name, dims, out_k, quant);
+         const qn = try store.normScale(gpa, try store.tensor(try std.fmt.bufPrint(&buf, "{s}.q_norm.weight", .{ap})));
+         defer gpa.free(qn);
+         const kn = try store.normScale(gpa, try store.tensor(try std.fmt.bufPrint(&buf, "{s}.k_norm.weight", .{ap})));
+@@ -429,7 +435,7 @@
+     var experts_down = deadBuf(driver);
+     errdefer experts_down.free();
+     if (store.has(try std.fmt.bufPrint(&buf, "{s}.experts.0.gate_proj.weight", .{mlp_root}))) {
+-        native_experts = try mixed.load(gpa, driver, store, mlp_root, world, rank, cut != null);
++        native_experts = try mixed.loadQuant(gpa, driver, store, mlp_root, world, rank, cut != null, if (quant == .bf16) .bf16 else .mxfp8);
+     } else {
+         if (world != 1 or rank != 0) return error.UnsupportedQuantization;
+         const legacy = legacy_block: {
+diff --git a/zig/src/families/flashnext/cuda_mixed_experts.zig b/zig/src/families/flashnext/cuda_mixed_experts.zig
+--- a/zig/src/families/flashnext/cuda_mixed_experts.zig
++++ b/zig/src/families/flashnext/cuda_mixed_experts.zig
+@@ -4,6 +4,7 @@
+ const wt = @import("cuda_prompt_wt.zig");
+ const routed = @import("cuda_modelopt_experts.zig");
+ const projections = @import("cuda_projection_load.zig");
++const mtp_quant = @import("cuda_mtp_quant.zig");
+ 
+ pub const Owned = struct {
+     experts: routed.Owned,
+@@ -19,6 +20,10 @@
+ };
+ 
+ pub fn load(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, prefix: []const u8, world: usize, rank: usize, split: bool) !Owned {
++    return loadQuant(a, d, store, prefix, world, rank, split, .bf16);
++}
++
++pub fn loadQuant(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, prefix: []const u8, world: usize, rank: usize, split: bool, quant: mtp_quant.Mode) !Owned {
+     var e = try routed.load(a, d, store, prefix, world, rank);
+     errdefer e.free();
+     var shared: [3]wt.Q4 = @splat(wt.Q4.empty(d));
+@@ -30,7 +35,7 @@
+             const n = if (i == 2) wt.dims else wt.moe_w;
+             const k = if (i == 2) wt.moe_w else wt.dims;
+             const key = try std.fmt.bufPrint(&buf, "{s}.shared_expert.{s}", .{ prefix, name });
+-            shared[i] = if (split) try projections.loadCut(a, d, store, key, n, k, try routed.Cut.init(n, world, rank), .rows) else try projections.load(a, d, store, key, n, k);
++            shared[i] = if (split) try projections.loadCut(a, d, store, key, n, k, try routed.Cut.init(n, world, rank), .rows) else if (quant == .bf16) try projections.load(a, d, store, key, n, k) else try mtp_quant.loadProjection(a, d, store, key, n, k, quant);
+             if (shared[i].native == null) return error.UnsupportedQuantization;
+         }
+     }
+diff --git a/zig/src/families/flashnext/cuda_batch.zig b/zig/src/families/flashnext/cuda_batch.zig
+--- a/zig/src/families/flashnext/cuda_batch.zig
++++ b/zig/src/families/flashnext/cuda_batch.zig
+@@ -204,7 +204,7 @@
+                 try self.tri.hcNormalize(h, pss, hc_w.scale.ptr, norm, eps, n, dims, streams);
+                 return hc.readoutNative(self, hc_w, r0, n);
+             }
+-            if (n >= self.k.forms.readout_rows and self.tri.readoutTilesOwned() and std.meta.eql(keep, HcKeep{})) return tiles.readout(self.tri, self.k, self.stream, self.s, hc_w, r0, n);
++            if ((n >= self.k.forms.readout_rows or hc_sk * n * hc_w.n_down * 4 > s.hc_part_bytes) and self.tri.readoutTilesOwned() and std.meta.eql(keep, HcKeep{})) return tiles.readout(self.tri, self.k, self.stream, self.s, hc_w, r0, n);
+             try self.copy(keep.h, h, n * wide * 2);
+             if (hc_sk * n * hc_w.n_down * 4 > s.hc_part_bytes) return error.UnexpectedTensor;
+             try self.tri.hcDown(h, pss, hc_w.scale.ptr, norm, hc_w.down.w.ptr, hc_w.down.s.ptr, hc_w.down.b.ptr, s.dn, s.hc_part, eps, n, hc_w.n_down, wide, dims, dims / 256, streams, hc_sk);
+diff --git a/zig/src/families/flashnext/cuda_window_graph.zig b/zig/src/families/flashnext/cuda_window_graph.zig
+--- a/zig/src/families/flashnext/cuda_window_graph.zig
++++ b/zig/src/families/flashnext/cuda_window_graph.zig
+@@ -111,6 +111,7 @@
+ 
+     pub fn init(seq: anytype, pos0: usize, rows: usize, s: *const parts.Scratch, scores: u64, model: u64, hooks: parts.Hooks) Key {
+         var h: Hash = .{};
++        h.fixed(@intFromBool(s.part_zero));
+         h.geometry(.at(pos0 + rows, seq.cap));
+         h.values(&[_]u64{ seq.gen, seq.cap, pieces(seq), s.h, s.cap, scores, model, hooks.logits_out, hooks.streams });
+         h.keep(hooks.keep);
+@@ -145,6 +146,7 @@
+ 
+     pub fn init(lanes: []const parts.Lane, s: *const parts.Scratch, scores: u64, model: u64, out: u64, attn: bool) SharedKey {
+         var h: Hash = .{};
++        h.fixed(@intFromBool(s.part_zero));
+         var rows: usize = 0;
+         for (lanes) |l| {
+             h.fixed(l.rows);
+diff --git a/zig/src/families/flashnext/cuda_window_graph_test.zig b/zig/src/families/flashnext/cuda_window_graph_test.zig
+--- a/zig/src/families/flashnext/cuda_window_graph_test.zig
++++ b/zig/src/families/flashnext/cuda_window_graph_test.zig
+@@ -143,6 +143,7 @@
+     var s: parts.Scratch = undefined;
+     s.h = 0x3000;
+     s.cap = 64;
++    s.part_zero = true;
+     return .init(seq, pos0, rows, &s, 0x5000, 0x4000, hooks);
+ }
+ 
+@@ -236,6 +237,7 @@
+     var s: parts.Scratch = undefined;
+     s.h = 0x3000;
+     s.cap = 64;
++    s.part_zero = true;
+     return .init(lanes, &s, 0x5000, 0x4000, 0x6000, false);
+ }
+ 
+diff --git a/zig/src/families/flashnext/cuda_zero_slice.zig b/zig/src/families/flashnext/cuda_zero_slice.zig
+--- a/zig/src/families/flashnext/cuda_zero_slice.zig
++++ b/zig/src/families/flashnext/cuda_zero_slice.zig
+@@ -7,7 +7,9 @@
+ 
+ /// A lane write into part that reaches the zero slice: a legacy tile's slices, or a native slice past cap rows.
+ pub fn spends(native: bool, sk: usize, m: usize, n: usize, cap: usize) bool {
+-    return sk > 1 and (!native or m * n > cap * dims);
++    if (sk <= 1) return false;
++    const n_slices: usize = if (native or m >= 64) 1 else sk;
++    return n_slices * m * n > cap * dims;
+ }
+ 
+ /// Pass.lane into s.part: spends the zero slice as it must; `zero` and native: one slice, no clears (1), else null.
